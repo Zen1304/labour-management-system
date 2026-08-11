@@ -1,0 +1,433 @@
+:root {
+  --bg: #f4f5fa;
+  --page-plane: #eef0f7;
+  --panel: #ffffff;
+  --surface-2: #fafafe; /* subtle tint on top of --panel: table headers, row hover, chart placeholders */
+  --border: #e5e7f0;
+  --border-soft: #eef0f6;
+  --text: #171a24;
+  --text-secondary: #454b5c;
+  --muted: #6b7185;
+  --muted-2: #9a9fb2;
+
+  --primary: #4f46e5;
+  --primary-dark: #3c33c9;
+  --primary-light: #eeecfd;
+  --accent: #0ea5a4;
+  --accent-light: #e3f8f7;
+
+  --green: #0f9d63;
+  --green-bg: #e4f7ee;
+  --red: #e0334f;
+  --red-bg: #fdeaee;
+  --amber: #b97406;
+  --amber-bg: #fdf1dd;
+
+  --radius: 14px;
+  --radius-sm: 9px;
+  --radius-lg: 20px;
+  --shadow-sm: 0 1px 2px rgba(23, 26, 36, 0.05);
+  --shadow-md: 0 6px 20px rgba(23, 26, 36, 0.07), 0 1px 3px rgba(23, 26, 36, 0.05);
+  --shadow-lg: 0 16px 40px rgba(23, 26, 36, 0.12);
+
+  --sidebar-w: 248px;
+}
+
+/* Dark theme — toggled by the `data-theme` attribute layout() sets on <html>
+   from the "theme" cookie (see render.js / the /theme/toggle route). Every
+   surface/text/border color in the app is already read through one of these
+   custom properties, so redefining them here is enough to re-theme the
+   whole app without touching component CSS — the sidebar keeps its own
+   fixed dark navy (it was already dark in light mode by design), and
+   semantic status colors (green/red/amber) keep enough contrast to stay
+   legible on a dark panel without needing separate dark variants. */
+html[data-theme='dark'] {
+  --bg: #14141c;
+  --page-plane: #101017;
+  --panel: #1b1b26;
+  --surface-2: #22222f;
+  --border: #33333f;
+  --border-soft: #2a2a36;
+  --text: #eceafc;
+  --text-secondary: #c2c1d9;
+  --muted: #9a9ab3;
+  --muted-2: #6f6f88;
+
+  --primary-light: #2c2861;
+  --accent-light: #123534;
+
+  --green-bg: #123324;
+  --red-bg: #3a1620;
+  --amber-bg: #3a2c0d;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.5);
+}
+* { box-sizing: border-box; }
+html { -webkit-font-smoothing: antialiased; }
+body {
+  margin: 0;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background:
+    radial-gradient(1200px 520px at 100% -10%, rgba(79, 70, 229, 0.07), transparent 55%),
+    radial-gradient(900px 420px at -5% 15%, rgba(14, 165, 164, 0.06), transparent 55%),
+    var(--page-plane);
+  background-attachment: fixed;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.5;
+}
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ---------------------------------------------------------------- */
+/* Sidebar                                                           */
+/* ---------------------------------------------------------------- */
+.sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--sidebar-w);
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, #16152b 0%, #1c1a35 100%);
+  color: #eceafc;
+  z-index: 30;
+  overflow-y: auto;
+}
+.sidebar .brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 26px 22px 22px;
+}
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+  color: #fff;
+  font-weight: 800;
+  font-size: 17px;
+  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.4);
+}
+.brand-name {
+  font-weight: 800;
+  font-size: 14px;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: #fff;
+}
+
+.nav { flex: 1; padding: 4px 14px 20px; }
+.nav-group { margin-bottom: 18px; }
+.nav-group-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #8985b8;
+  padding: 0 10px;
+  margin-bottom: 6px;
+}
+.nav-group a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #c7c5e6;
+  font-weight: 600;
+  font-size: 13.5px;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 2px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.nav-icon { font-size: 14px; opacity: 0.9; width: 16px; text-align: center; }
+.nav-group a:hover { color: #fff; background: rgba(255, 255, 255, 0.07); text-decoration: none; }
+.nav-group a.active { color: #fff; background: linear-gradient(135deg, rgba(79, 70, 229, 0.55), rgba(14, 165, 164, 0.4)); box-shadow: 0 2px 10px rgba(79, 70, 229, 0.25); }
+
+.sidebar-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  margin: 8px 14px 18px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-sm);
+}
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: #fff;
+  font-weight: 700;
+  font-size: 12.5px;
+}
+.sidebar-user-info { display: flex; flex-direction: column; gap: 2px; overflow: hidden; flex: 1; }
+.sidebar-user-name { font-size: 13px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.role-badge { background: rgba(255, 255, 255, 0.12); color: #d8d6f5; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; width: fit-content; }
+.logout-link { color: #b5b2dd; font-weight: 600; font-size: 15px; padding: 4px; border-radius: 6px; }
+.logout-link:hover { color: #fff; text-decoration: none; background: rgba(255, 255, 255, 0.1); }
+.logout-form { display: inline-flex; margin: 0; }
+button.logout-link { background: none; border: none; font: inherit; cursor: pointer; }
+
+body.has-sidebar .container { margin-left: var(--sidebar-w); }
+
+@media (max-width: 860px) {
+  .sidebar { position: static; width: 100%; height: auto; }
+  body.has-sidebar .container { margin-left: 0; }
+  .nav { display: flex; flex-wrap: wrap; padding: 8px 14px 14px; }
+  .nav-group { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin-bottom: 6px; margin-right: 10px; }
+  .nav-group-title { display: none; }
+}
+
+.container { max-width: 1200px; margin: 0 auto; padding: 40px 40px 70px; }
+
+h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: -0.015em; font-weight: 800; }
+h2 { font-size: 16px; margin: 32px 0 14px; font-weight: 700; letter-spacing: -0.005em; }
+h2:first-child { margin-top: 0; }
+.subtitle { color: var(--muted); margin: 0 0 26px; font-size: 14px; max-width: 74ch; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 26px;
+  margin-bottom: 24px;
+  box-shadow: var(--shadow-sm);
+}
+.card.muted { background: var(--bg); box-shadow: none; color: var(--text-secondary); font-size: 14px; }
+
+.grid { display: grid; gap: 18px; }
+.grid-4 { grid-template-columns: repeat(4, 1fr); }
+.grid-3 { grid-template-columns: repeat(3, 1fr); }
+.grid-2 { grid-template-columns: repeat(2, 1fr); }
+@media (max-width: 900px) { .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 560px) { .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; } }
+
+.stat {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+  overflow: hidden;
+}
+.stat::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--primary), var(--accent));
+  opacity: 0.85;
+}
+.stat:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.stat .stat-label { color: var(--muted); font-size: 12.5px; font-weight: 600; margin-bottom: 9px; text-transform: uppercase; letter-spacing: 0.03em; }
+.stat .stat-value { font-size: 29px; font-weight: 800; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.stat .stat-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+table { width: 100%; border-collapse: collapse; background: var(--panel); }
+th, td { padding: 13px 16px; text-align: left; border-bottom: 1px solid var(--border-soft); font-size: 13.5px; }
+th { color: var(--muted); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; background: var(--surface-2); }
+tbody tr { transition: background 0.1s ease; }
+tbody tr:hover { background: var(--surface-2); }
+tr:last-child td { border-bottom: none; }
+/* overflow: auto (not hidden) so a table too wide for its container scrolls
+   inside the card instead of pushing the whole page sideways. Still clips to
+   the border-radius exactly as `hidden` did, and no scrollbar appears at all
+   when the table fits — desktop layouts are unchanged. */
+.table-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; box-shadow: var(--shadow-sm); margin-bottom: 20px; }
+.table-wrap table { margin-bottom: 0; }
+.table-wrap .table-wrap { box-shadow: none; margin-bottom: 0; }
+/* On a narrow viewport, keep columns legible and let the table scroll rather
+   than letting 6-7 columns squeeze into unreadable slivers. */
+@media (max-width: 900px) {
+  .table-wrap table { min-width: 640px; }
+}
+
+.attendance-day-group { margin-bottom: 20px; }
+.attendance-day-group .table-wrap { margin-bottom: 0; }
+.attendance-day-heading {
+  font-weight: 700;
+  font-size: 13.5px;
+  color: var(--text-secondary);
+  padding: 10px 4px;
+  letter-spacing: 0.01em;
+}
+
+.btn {
+  display: inline-block;
+  background: var(--primary);
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: var(--radius-sm);
+  border: none;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(79, 70, 229, 0.25);
+  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
+}
+.btn:hover { background: var(--primary-dark); text-decoration: none; box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3); }
+.btn:active { transform: translateY(1px); }
+.btn.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); box-shadow: none; }
+.btn.secondary:hover { background: var(--bg); }
+.btn.danger { background: var(--red); box-shadow: 0 1px 2px rgba(224, 51, 79, 0.25); }
+.btn.danger:hover { background: #c22943; }
+.btn.small { padding: 6px 12px; font-size: 12.5px; }
+
+form.inline { display: inline; }
+
+label { display: block; font-size: 12px; font-weight: 700; margin-bottom: 7px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+input, select, textarea {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  background: var(--panel);
+  color: var(--text);
+  margin-bottom: 16px;
+  font-family: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
+.form-row { display: flex; gap: 18px; }
+.form-row > div { flex: 1; }
+
+.badge { padding: 3px 11px; border-radius: 999px; font-size: 11.5px; font-weight: 700; letter-spacing: 0.01em; }
+.badge.present, .badge.active { background: var(--green-bg); color: var(--green); }
+.badge.absent, .badge.inactive { background: var(--red-bg); color: var(--red); }
+.badge.half_day { background: var(--amber-bg); color: var(--amber); }
+
+.flash { padding: 14px 18px; border-radius: var(--radius-sm); margin-bottom: 20px; font-size: 14px; font-weight: 500; }
+.flash-success { background: var(--green-bg); color: var(--green); }
+.flash-error { background: var(--red-bg); color: var(--red); }
+
+/* Light/dark toggle — inside the sidebar it's just another nav link (styled
+   by .nav-group a already); on the login page (no sidebar) it floats
+   top-right instead. */
+.theme-toggle-floating {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+  z-index: 40;
+}
+.theme-toggle-floating:hover { color: var(--text); text-decoration: none; box-shadow: var(--shadow-md); }
+.theme-toggle-floating .nav-icon { font-size: 14px; }
+
+.login-wrap { max-width: 408px; margin: 9vh auto; }
+.login-wrap .card { padding: 40px 34px; box-shadow: var(--shadow-lg); border-radius: var(--radius-lg); }
+.login-wrap h1 { text-align: center; margin-bottom: 4px; }
+.login-wrap .subtitle { text-align: center; margin-left: auto; margin-right: auto; }
+.login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 18px;
+}
+.hint { font-size: 12.5px; color: var(--muted); margin-top: 8px; line-height: 1.55; }
+
+.muted { color: var(--muted); }
+.text-right { text-align: right; }
+
+/* Section framing — separates an occasional admin setup step from the daily
+   workflow on the same page (e.g. Skill assessments: "manage categories"
+   vs. "rate a worker") so the two don't visually blur together. */
+.eyebrow { text-transform: uppercase; font-size: 11px; letter-spacing: 0.08em; color: var(--muted); font-weight: 700; margin: 0 0 4px; }
+.section-divider { border: none; border-top: 1px solid var(--border); margin: 32px 0 26px; }
+
+details.admin-panel {
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 16px 22px;
+  margin-bottom: 28px;
+}
+details.admin-panel[open] {
+  background: var(--panel);
+  border-style: solid;
+  box-shadow: var(--shadow-sm);
+  padding: 22px 26px;
+}
+details.admin-panel summary {
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 14.5px;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-secondary);
+}
+details.admin-panel summary::-webkit-details-marker { display: none; }
+details.admin-panel summary::before {
+  content: '\25B8';
+  font-size: 11px;
+  color: var(--muted-2);
+  transition: transform 0.15s ease;
+  display: inline-block;
+}
+details.admin-panel[open] summary::before { transform: rotate(90deg); }
+details.admin-panel summary .hint-inline { font-weight: 400; color: var(--muted); font-size: 12.5px; }
+details.admin-panel .details-body { margin-top: 18px; }
+
+.card.highlight { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
+.mt-0 { margin-top: 0; }
+.actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+
+/* ---- Pagination ---- */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: -6px 0 22px;
+  padding: 4px 2px;
+}
+.pagination-links { display: flex; gap: 8px; }
+
+/* ---- Charts (plain SVG, no client-side chart library) ---- */
+.chart-wrap { width: 100%; }
+.chart-wrap svg { display: block; overflow: visible; }
+.chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted-2);
+  font-size: 13.5px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border);
+}
+.chart-legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.chart-legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-secondary); font-weight: 600; }
+.chart-swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+.mini-bar-track { width: 100%; max-width: 140px; height: 6px; background: var(--border-soft); border-radius: 999px; overflow: hidden; }
+.mini-bar-fill { height: 100%; border-radius: 999px; }

@@ -1,0 +1,15 @@
+{
+  "name": "labour-management-system",
+  "version": "0.1.0",
+  "description": "Labour Management & Attendance Workflow prototype",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node src/seed.js",
+    "backup": "node backup-db.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
