@@ -1,6 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
-const db = require('./db');
+const { pool, nowSqliteStyle } = require('./db');
 
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 
@@ -18,13 +18,14 @@ function verifyPassword(password, salt, expectedHash) {
   return crypto.timingSafeEqual(a, b);
 }
 
-function createUser({ username, password, name, role, site_id, contact, mustChangePassword }) {
+async function createUser({ username, password, name, role, site_id, contact, mustChangePassword }) {
   const { hash, salt } = hashPassword(password);
-  const stmt = db.prepare(
-    `INSERT INTO users (username, password_hash, salt, name, role, site_id, contact, must_change_password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  const result = await pool.query(
+    `INSERT INTO users (username, password_hash, salt, name, role, site_id, contact, must_change_password, active, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9) RETURNING id`,
+    [username, hash, salt, name, role, site_id || null, contact || null, mustChangePassword ? 1 : 0, nowSqliteStyle()]
   );
-  const info = stmt.run(username, hash, salt, name, role, site_id || null, contact || null, mustChangePassword ? 1 : 0);
-  return info.lastInsertRowid;
+  return result.rows[0].id;
 }
 
 // v10: for one-time temporary passwords (new accounts, and password resets
@@ -46,12 +47,14 @@ function generateTempPassword(length) {
   return out;
 }
 
-function findUserByUsername(username) {
-  return db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+async function findUserByUsername(username) {
+  const { rows } = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+  return rows[0];
 }
 
-function findUserById(id) {
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+async function findUserById(id) {
+  const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+  return rows[0];
 }
 
 // Login lockout: 8 failed attempts for a username locks it out for 15
@@ -60,62 +63,67 @@ function findUserById(id) {
 const MAX_FAILED_ATTEMPTS = 8;
 const LOCKOUT_MS = 15 * 60 * 1000;
 
-function isLockedOut(username) {
-  const row = db.prepare('SELECT * FROM login_attempts WHERE username = ?').get(username);
+async function isLockedOut(username) {
+  const { rows } = await pool.query('SELECT * FROM login_attempts WHERE username = $1', [username]);
+  const row = rows[0];
   if (!row || !row.locked_until) return false;
   if (new Date(row.locked_until).getTime() <= Date.now()) return false;
   return true;
 }
 
-function recordFailedAttempt(username) {
-  const row = db.prepare('SELECT * FROM login_attempts WHERE username = ?').get(username);
+async function recordFailedAttempt(username) {
+  const { rows } = await pool.query('SELECT * FROM login_attempts WHERE username = $1', [username]);
+  const row = rows[0];
   const count = (row ? row.failed_count : 0) + 1;
   const lockedUntil = count >= MAX_FAILED_ATTEMPTS ? new Date(Date.now() + LOCKOUT_MS).toISOString() : row ? row.locked_until : null;
-  db.prepare(
-    `INSERT INTO login_attempts (username, failed_count, locked_until) VALUES (?, ?, ?)
-     ON CONFLICT(username) DO UPDATE SET failed_count = excluded.failed_count, locked_until = excluded.locked_until`
-  ).run(username, count, lockedUntil);
+  await pool.query(
+    `INSERT INTO login_attempts (username, failed_count, locked_until) VALUES ($1, $2, $3)
+     ON CONFLICT (username) DO UPDATE SET failed_count = EXCLUDED.failed_count, locked_until = EXCLUDED.locked_until`,
+    [username, count, lockedUntil]
+  );
 }
 
-function clearFailedAttempts(username) {
-  db.prepare('DELETE FROM login_attempts WHERE username = ?').run(username);
+async function clearFailedAttempts(username) {
+  await pool.query('DELETE FROM login_attempts WHERE username = $1', [username]);
 }
 
-function login(username, password) {
-  if (isLockedOut(username)) return { locked: true };
-  const user = findUserByUsername(username);
+async function login(username, password) {
+  if (await isLockedOut(username)) return { locked: true };
+  const user = await findUserByUsername(username);
   if (!user || !user.active) {
-    recordFailedAttempt(username);
+    await recordFailedAttempt(username);
     return null;
   }
   if (!verifyPassword(password, user.salt, user.password_hash)) {
-    recordFailedAttempt(username);
+    await recordFailedAttempt(username);
     return null;
   }
-  clearFailedAttempts(username);
+  await clearFailedAttempts(username);
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(
+  await pool.query('INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES ($1, $2, $3, $4)', [
     token,
     user.id,
-    expiresAt
-  );
+    expiresAt,
+    nowSqliteStyle(),
+  ]);
   return token;
 }
 
-function logout(token) {
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+async function logout(token) {
+  await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
 }
 
-function getUserFromToken(token) {
+async function getUserFromToken(token) {
   if (!token) return null;
-  const session = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  const { rows } = await pool.query('SELECT * FROM sessions WHERE token = $1', [token]);
+  const session = rows[0];
   if (!session) return null;
   if (new Date(session.expires_at).getTime() < Date.now()) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
     return null;
   }
-  const user = findUserById(session.user_id);
+  const user = await findUserById(session.user_id);
   // v10 fix: deactivating a user previously only blocked *new* logins —
   // login() already checked user.active, but this function (called on
   // every single request to resolve "who is this session") never did, so
@@ -125,7 +133,7 @@ function getUserFromToken(token) {
   // its own, so a background admin action visibly and immediately signs the
   // person out instead of quietly leaving a live-but-orphaned session.
   if (!user || !user.active) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
     return null;
   }
   return user;

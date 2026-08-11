@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { URL } = require('node:url');
-const db = require('./db');
+const { pool, nowSqliteStyle } = require('./db');
 const auth = require('./auth');
 const csrf = require('./csrf');
 // Renamed on import: handleRequest defines its own per-request `layout`
@@ -66,15 +66,16 @@ function paginationControls(basePath, page, totalCount, pageSize) {
 // simple and best-effort: an audit-log write failure should never block the
 // actual action, so this never throws (mirrors how memory/logging failures
 // are handled elsewhere — the primary action always wins).
-function logAudit(userId, action, entityType, entityId, details) {
+async function logAudit(userId, action, entityType, entityId, details) {
   try {
-    db.prepare('INSERT INTO audit_log (user_id, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?)').run(
+    (await pool.query('INSERT INTO audit_log (user_id, action, entity_type, entity_id, details, created_at) VALUES ($1, $2, $3, $4, $5, $6)', [
       userId || null,
       action,
       entityType,
       entityId || null,
-      details || null
-    );
+      details || null,
+      nowSqliteStyle(),
+    ]));
   } catch (e) {
     console.error('audit log write failed', e);
   }
@@ -103,15 +104,13 @@ const {
 // nothing, array of ids = restricted to exactly those sites. Supervisors get
 // their single assigned site; Project Managers/Site Engineers get every site
 // in user_site_assignments; everyone else with oversight is unrestricted.
-function assignedSiteIds(userId) {
-  return db
-    .prepare('SELECT site_id FROM user_site_assignments WHERE user_id = ? ORDER BY site_id')
-    .all(userId)
+async function assignedSiteIds(userId) {
+  return (await pool.query('SELECT site_id FROM user_site_assignments WHERE user_id = $1 ORDER BY site_id', [userId])).rows
     .map((r) => r.site_id);
 }
-function siteScopeForUser(user) {
+async function siteScopeForUser(user) {
   if (user.role === 'supervisor') return user.site_id ? [Number(user.site_id)] : [];
-  if (MULTI_SITE_ROLES.includes(user.role)) return assignedSiteIds(user.id);
+  if (MULTI_SITE_ROLES.includes(user.role)) return await assignedSiteIds(user.id);
   return null;
 }
 // Raw SQL fragment restricting a site-id column expression to a scope —
@@ -160,39 +159,37 @@ function isValidDateStr(s) {
 // Unassigned Pool), is currently active (not on hold / completed), and falls
 // inside this user's site scope. Admin/HR have scope null = unrestricted, so
 // they keep full cross-site access and only the first three tests apply.
-function attendanceSiteError(user, siteId) {
+async function attendanceSiteError(user, siteId) {
   const id = Number(siteId);
   if (!id || id === POOL_SITE_ID) return ATTENDANCE_BAD_SITE;
-  const site = db.prepare('SELECT id, status FROM sites WHERE id = ?').get(id);
+  const site = (await pool.query('SELECT id, status FROM sites WHERE id = $1', [id])).rows[0];
   if (!site || site.status !== 'active') return ATTENDANCE_BAD_SITE;
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   if (scope !== null && !scope.includes(id)) return ATTENDANCE_BAD_SITE;
   return null;
 }
 
-function attendanceWorkerError(workerId) {
+async function attendanceWorkerError(workerId) {
   const id = Number(workerId);
   if (!id) return ATTENDANCE_BAD_WORKER;
-  const w = db.prepare('SELECT id, status FROM workers WHERE id = ?').get(id);
+  const w = (await pool.query('SELECT id, status FROM workers WHERE id = $1', [id])).rows[0];
   if (!w || w.status !== 'active') return ATTENDANCE_BAD_WORKER;
   return null;
 }
 
 // Full check for one attendance write. Returns an error string, or null when
 // the write is allowed.
-function attendanceWriteError(user, { worker_id, site_id, date }) {
+async function attendanceWriteError(user, { worker_id, site_id, date }) {
   if (!isValidDateStr(date)) return ATTENDANCE_BAD_DATE;
-  return attendanceSiteError(user, site_id) || attendanceWorkerError(worker_id);
+  return await attendanceSiteError(user, site_id) || await attendanceWorkerError(worker_id);
 }
 
 // Sites this user could actually record attendance against right now — the
 // same rule as attendanceSiteError, expressed as a list so the pages can tell
 // a site-scoped user *why* they're blocked instead of just refusing the save.
-function eligibleAttendanceSites(user) {
-  const scope = siteScopeForUser(user);
-  return db
-    .prepare(`SELECT id, name, status FROM sites WHERE status = 'active' AND id != ${POOL_SITE_ID} ORDER BY id`)
-    .all()
+async function eligibleAttendanceSites(user) {
+  const scope = await siteScopeForUser(user);
+  return (await pool.query(`SELECT id, name, status FROM sites WHERE status = 'active' AND id != ${POOL_SITE_ID} ORDER BY id`, [])).rows
     .filter((s) => scope === null || scope.includes(Number(s.id)));
 }
 
@@ -200,9 +197,9 @@ function eligibleAttendanceSites(user) {
 // attendance at all. That's intended (work is paused there), but it must say
 // so plainly — otherwise it reads as the app being broken. Only ever shown to
 // someone about their OWN site, so naming its status leaks nothing.
-function noEligibleSiteNotice(user) {
-  if (siteScopeForUser(user) === null || eligibleAttendanceSites(user).length > 0) return '';
-  const own = user.site_id ? db.prepare('SELECT name, status FROM sites WHERE id = ?').get(user.site_id) : null;
+async function noEligibleSiteNotice(user) {
+  if ((await siteScopeForUser(user)) === null || (await eligibleAttendanceSites(user)).length > 0) return '';
+  const own = user.site_id ? (await pool.query('SELECT name, status FROM sites WHERE id = $1', [user.site_id])).rows[0] : null;
   const statusText = own ? `is currently marked ${SITE_STATUS_LABEL[own.status] || own.status}` : 'is not set';
   return `<div class="flash flash-error">Attendance can't be recorded right now — your site ${
     own ? `(${esc(own.name)}) ` : ''
@@ -212,10 +209,10 @@ function noEligibleSiteNotice(user) {
 // A worker recorded somewhere other than their home site is legitimate (that's
 // the split-site case) but worth a trail, so it can be reviewed rather than
 // merely trusted.
-function auditCrossSiteAttendance(user, workerId, siteId, date) {
-  const w = db.prepare('SELECT name, site_id FROM workers WHERE id = ?').get(Number(workerId) || 0);
+async function auditCrossSiteAttendance(user, workerId, siteId, date) {
+  const w = (await pool.query('SELECT name, site_id FROM workers WHERE id = $1', [Number(workerId) || 0])).rows[0];
   if (!w || Number(w.site_id) === Number(siteId)) return;
-  logAudit(
+  await logAudit(
     user.id,
     'create',
     'attendance',
@@ -407,8 +404,8 @@ function superAdminGuardError(actingUser, { targetRole, submittedRole } = {}) {
 // ---------- Shared lookups ----------
 // Lists every vendor (any active state) — an inactive vendor is labeled, not
 // hard-hidden, so editing a worker never silently loses their current vendor.
-function vendorOptions(selectedId, { excludeId } = {}) {
-  const vendors = db.prepare('SELECT * FROM vendors ORDER BY is_direct DESC, name').all();
+async function vendorOptions(selectedId, { excludeId } = {}) {
+  const vendors = (await pool.query('SELECT * FROM vendors ORDER BY is_direct DESC, name', [])).rows;
   return vendors
     .filter((v) => !excludeId || v.id !== Number(excludeId))
     .map((v) => {
@@ -418,8 +415,8 @@ function vendorOptions(selectedId, { excludeId } = {}) {
     })
     .join('');
 }
-function workerTypeOptions(selectedId) {
-  const types = db.prepare('SELECT * FROM worker_types WHERE active = 1 ORDER BY name').all();
+async function workerTypeOptions(selectedId) {
+  const types = (await pool.query('SELECT * FROM worker_types WHERE active = 1 ORDER BY name', [])).rows;
   return types
     .map((t) => `<option value="${t.id}" ${String(t.id) === String(selectedId) ? 'selected' : ''}>${esc(t.name)}</option>`)
     .join('');
@@ -435,8 +432,8 @@ const SKILL_GRADE_LABEL = { trainee: 'Trainee', skilled: 'Skilled', expert: 'Exp
 // attendance — real, active sites — matching attendanceSiteError()'s rule so
 // the attendance pages never offer a choice the server would reject. Left off
 // everywhere else, where picking an on-hold/completed site is still valid.
-function siteOptions(selectedId, { excludeId, onlyIds, activeOnly } = {}) {
-  const sites = db.prepare('SELECT * FROM sites ORDER BY id').all();
+async function siteOptions(selectedId, { excludeId, onlyIds, activeOnly } = {}) {
+  const sites = (await pool.query('SELECT * FROM sites ORDER BY id', [])).rows;
   return sites
     .filter((s) => !excludeId || s.id !== Number(excludeId))
     .filter((s) => !onlyIds || onlyIds.includes(s.id))
@@ -452,40 +449,48 @@ function skillGradeOptions(selected) {
     .map(([val, label]) => `<option value="${val}" ${val === (selected || 'skilled') ? 'selected' : ''}>${label}</option>`)
     .join('');
 }
-function directVendorId() {
-  const v = db.prepare('SELECT id FROM vendors WHERE is_direct = 1 LIMIT 1').get();
+async function directVendorId() {
+  const v = (await pool.query('SELECT id FROM vendors WHERE is_direct = 1 LIMIT 1', [])).rows[0];
   return v ? v.id : null;
 }
-function findWorkerByAadhar(aadhar, excludeId) {
+async function findWorkerByAadhar(aadhar, excludeId) {
   if (excludeId) {
-    return db.prepare('SELECT * FROM workers WHERE aadhar_number = ? AND id != ?').get(aadhar, excludeId);
+    return (await pool.query('SELECT * FROM workers WHERE aadhar_number = $1 AND id != $2', [aadhar, excludeId])).rows[0];
   }
-  return db.prepare('SELECT * FROM workers WHERE aadhar_number = ?').get(aadhar);
+  return (await pool.query('SELECT * FROM workers WHERE aadhar_number = $1', [aadhar])).rows[0];
 }
 
 // ---------- Auto-generated IDs ----------
 // Workers and vendors both get a human-readable code assigned automatically —
 // nobody types these in. Monotonic, based on the highest existing suffix
 // rather than a row count, so a deleted record never causes a collision.
-function nextWorkerCode() {
+async function nextWorkerCode() {
   // As of v9.1, worker codes are "W00001", "W00002", ... (5-digit, no dash),
   // per Zen's request — a one-time migration in db.js renumbers any
   // pre-existing "WRK-xxxx"-style codes into this format, so this only ever
   // needs to look at the new pattern (mirrors nextVendorCode's V#### switch).
-  const row = db.prepare(`SELECT MAX(CAST(SUBSTR(worker_code, 2) AS INTEGER)) m FROM workers WHERE worker_code GLOB 'W[0-9][0-9][0-9][0-9][0-9]'`).get();
+  // Postgres has no GLOB; '~' is POSIX regex, equivalent to the old SQLite
+  // GLOB 'W[0-9][0-9][0-9][0-9][0-9]' pattern (anchored, exactly 5 digits).
+  const row = (
+    await pool.query(
+      `SELECT MAX(CAST(SUBSTRING(worker_code FROM 2) AS INTEGER)) m FROM workers WHERE worker_code ~ '^W[0-9]{5}$'`
+    )
+  ).rows[0];
   const next = (row && row.m ? row.m : 0) + 1;
   return 'W' + String(next).padStart(5, '0');
 }
-function nextVendorCode() {
+async function nextVendorCode() {
   // The built-in Direct vendor is seeded with its own fixed "B0xxx"-style code
   // and is never created through this path — this generates codes only for
   // regular vendors added through the app. As of v9, regular vendor codes are
   // "V0001", "V0002", ... (4-digit, no dash) — a one-time migration in db.js
   // renumbers any pre-existing "VEN-xxx"-style codes into this format, so this
   // only ever needs to look at the new pattern.
-  const row = db
-    .prepare(`SELECT MAX(CAST(SUBSTR(vendor_code, 2) AS INTEGER)) m FROM vendors WHERE vendor_code GLOB 'V[0-9][0-9][0-9][0-9]'`)
-    .get();
+  const row = (
+    await pool.query(
+      `SELECT MAX(CAST(SUBSTRING(vendor_code FROM 2) AS INTEGER)) m FROM vendors WHERE vendor_code ~ '^V[0-9]{4}$'`
+    )
+  ).rows[0];
   const next = (row && row.m ? row.m : 0) + 1;
   return 'V' + String(next).padStart(4, '0');
 }
@@ -496,10 +501,10 @@ function nextVendorCode() {
 // what's attached and either refuse with a clear, actionable message or offer
 // the safe alternative (deactivate/mark-inactive/reassign) instead of an
 // unhandled SQLite constraint error.
-function vendorDependencyCounts(vendorId) {
-  const workers = db.prepare('SELECT COUNT(*) c FROM workers WHERE vendor_id = ?').get(vendorId).c;
-  const activeWorkers = db.prepare("SELECT COUNT(*) c FROM workers WHERE vendor_id = ? AND status = 'active'").get(vendorId).c;
-  const payrollItems = db.prepare('SELECT COUNT(*) c FROM payroll_items WHERE vendor_id = ?').get(vendorId).c;
+async function vendorDependencyCounts(vendorId) {
+  const workers = (await pool.query('SELECT COUNT(*) c FROM workers WHERE vendor_id = $1', [vendorId])).rows[0].c;
+  const activeWorkers = (await pool.query("SELECT COUNT(*) c FROM workers WHERE vendor_id = $1 AND status = 'active'", [vendorId])).rows[0].c;
+  const payrollItems = (await pool.query('SELECT COUNT(*) c FROM payroll_items WHERE vendor_id = $1', [vendorId])).rows[0].c;
   return { workers, activeWorkers, payrollItems };
 }
 // Informational counts shown on a site's Edit page (worker reassignment
@@ -516,15 +521,15 @@ function vendorDependencyCounts(vendorId) {
 // the capability to be removed outright (v9, same policy as workers): a site
 // is retired via Status=Completed only, never permanently deleted, so this
 // function only needs to report what's still active for the reassignment UI.
-function siteDependencyCounts(siteId) {
-  const workers = db.prepare('SELECT COUNT(*) c FROM workers WHERE site_id = ?').get(siteId).c;
-  const attendance = db.prepare('SELECT COUNT(*) c FROM attendance WHERE site_id = ?').get(siteId).c;
-  const users = db.prepare('SELECT COUNT(*) c FROM users WHERE site_id = ?').get(siteId).c;
+async function siteDependencyCounts(siteId) {
+  const workers = (await pool.query('SELECT COUNT(*) c FROM workers WHERE site_id = $1', [siteId])).rows[0].c;
+  const attendance = (await pool.query('SELECT COUNT(*) c FROM attendance WHERE site_id = $1', [siteId])).rows[0].c;
+  const users = (await pool.query('SELECT COUNT(*) c FROM users WHERE site_id = $1', [siteId])).rows[0].c;
   return { workers, attendance, users };
 }
-function workerHistoryCounts(workerId) {
-  const attendance = db.prepare('SELECT COUNT(*) c FROM attendance WHERE worker_id = ?').get(workerId).c;
-  const payrollItems = db.prepare('SELECT COUNT(*) c FROM payroll_items WHERE worker_id = ?').get(workerId).c;
+async function workerHistoryCounts(workerId) {
+  const attendance = (await pool.query('SELECT COUNT(*) c FROM attendance WHERE worker_id = $1', [workerId])).rows[0].c;
+  const payrollItems = (await pool.query('SELECT COUNT(*) c FROM payroll_items WHERE worker_id = $1', [workerId])).rows[0].c;
   return { attendance, payrollItems };
 }
 
@@ -544,23 +549,19 @@ function shortDate(iso) {
   return `${m}/${d}`;
 }
 
-function attendanceTrendChart(days) {
+async function attendanceTrendChart(days) {
   const today = todayStr();
   const dates = lastNDates(days, today);
   const from = dates[0];
   const to = dates[dates.length - 1];
 
-  const sites = db.prepare(`SELECT id, name FROM sites WHERE id != ${POOL_SITE_ID} ORDER BY id`).all();
-  const activeCounts = db
-    .prepare(`SELECT site_id, COUNT(*) c FROM workers WHERE status = 'active' GROUP BY site_id`)
-    .all()
+  const sites = (await pool.query(`SELECT id, name FROM sites WHERE id != ${POOL_SITE_ID} ORDER BY id`, [])).rows;
+  const activeCounts = (await pool.query(`SELECT site_id, COUNT(*) c FROM workers WHERE status = 'active' GROUP BY site_id`, [])).rows
     .reduce((m, r) => ((m[r.site_id] = r.c), m), {});
-  const presentRows = db
-    .prepare(
+  const presentRows = (await pool.query(
       `SELECT site_id, date, COUNT(DISTINCT worker_id) c FROM attendance
-       WHERE date BETWEEN ? AND ? AND hours_worked > 0 GROUP BY site_id, date`
-    )
-    .all(from, to);
+       WHERE date BETWEEN $1 AND $2 AND hours_worked > 0 GROUP BY site_id, date`
+    , [from, to])).rows;
   const presentMap = {}; // "siteId|date" -> count
   presentRows.forEach((r) => (presentMap[`${r.site_id}|${r.date}`] = r.c));
 
@@ -590,142 +591,145 @@ function attendanceTrendChart(days) {
   return { chart, omitted };
 }
 
-function payrollCostTrendChart(limit) {
+async function payrollCostTrendChart(limit) {
   // Flagged runs are superseded/voided (see v8.1's flag-to-regenerate) — they
   // stay visible in the Payroll list for history, but excluding them here
   // keeps the trend and its date labels reflecting only the active run for
   // each period instead of double-counting a period that was regenerated.
-  const runs = db
-    .prepare(
+  const runs = (await pool.query(
       `SELECT pr.id, pr.period_start, pr.period_end,
         (SELECT COALESCE(SUM(pi.base_pay + pi.overtime_pay),0) - COALESCE((SELECT SUM(pd.amount) FROM payroll_deductions pd JOIN payroll_items pi2 ON pi2.id = pd.payroll_item_id WHERE pi2.payroll_run_id = pr.id),0)
          FROM payroll_items pi WHERE pi.payroll_run_id = pr.id) net
-       FROM payroll_runs pr WHERE pr.flagged = 0 ORDER BY pr.id DESC LIMIT ?`
-    )
-    .all(limit)
+       FROM payroll_runs pr WHERE pr.flagged = 0 ORDER BY pr.id DESC LIMIT $1`
+    , [limit])).rows
     .reverse();
   const data = runs.map((r) => ({ label: shortDate(r.period_start), value: r.net }));
   return svgBarChart({ data, color: '#2a78d6', valueFmt: (v) => fmtMoney(v).replace('₹', ''), emptyText: 'No payroll runs generated yet.' });
 }
 
-function performanceAdjustmentImpact() {
-  const adjustments = db
-    .prepare(
+async function performanceAdjustmentImpact() {
+  const adjustments = (await pool.query(
       `SELECT sp.*, s.name site_name FROM site_performance sp JOIN sites s ON s.id = sp.site_id ORDER BY sp.period_start DESC`
-    )
-    .all();
+    , [])).rows;
   let totalDeducted = 0; // cuts only (positive)
   let totalAdded = 0; // bonuses + additional payments (positive, shown as an addition)
-  const rows = adjustments.map((c) => {
-    let pattern;
-    if (c.adjustment_type === 'additional_payment') {
-      pattern = `${c.site_name} additional payment (${c.period_start} to ${c.period_end}%`;
-    } else {
-      pattern = `${c.site_name} performance ${c.adjustment_type} — ${c.cut_percent}% (${c.period_start} to ${c.period_end}%`;
-    }
-    // Exclude deductions that belong to a flagged (superseded/voided)
-    // payroll run — same reasoning as the payroll cost trend chart.
-    const sumAmount = db
-      .prepare(
-        `SELECT COALESCE(SUM(pd.amount),0) c FROM payroll_deductions pd
-         JOIN payroll_items pi ON pi.id = pd.payroll_item_id
-         JOIN payroll_runs pr ON pr.id = pi.payroll_run_id
-         WHERE pd.reason LIKE ? AND pr.flagged = 0`
-      )
-      .get(pattern).c;
-    // Cuts store positive amounts (deductions); bonuses/additional payments
-    // store negative amounts (additions) — normalize to a positive display
-    // figure either way.
-    const amount = Math.abs(sumAmount);
-    if (c.adjustment_type === 'cut') totalDeducted += amount;
-    else totalAdded += amount;
-    return Object.assign({}, c, { amount_applied: amount });
-  });
+  const rows = await Promise.all(
+    adjustments.map(async (c) => {
+      let pattern;
+      if (c.adjustment_type === 'additional_payment') {
+        pattern = `${c.site_name} additional payment (${c.period_start} to ${c.period_end}%`;
+      } else {
+        pattern = `${c.site_name} performance ${c.adjustment_type} — ${c.cut_percent}% (${c.period_start} to ${c.period_end}%`;
+      }
+      // Exclude deductions that belong to a flagged (superseded/voided)
+      // payroll run — same reasoning as the payroll cost trend chart.
+      const sumAmount = (
+        await pool.query(
+          `SELECT COALESCE(SUM(pd.amount),0) c FROM payroll_deductions pd
+           JOIN payroll_items pi ON pi.id = pd.payroll_item_id
+           JOIN payroll_runs pr ON pr.id = pi.payroll_run_id
+           WHERE pd.reason LIKE $1 AND pr.flagged = 0`,
+          [pattern]
+        )
+      ).rows[0].c;
+      // Cuts store positive amounts (deductions); bonuses/additional payments
+      // store negative amounts (additions) — normalize to a positive display
+      // figure either way.
+      const amount = Math.abs(sumAmount);
+      if (c.adjustment_type === 'cut') totalDeducted += amount;
+      else totalAdded += amount;
+      return Object.assign({}, c, { amount_applied: amount });
+    })
+  );
   const totalCuts = adjustments.filter((c) => c.adjustment_type === 'cut').length;
   const totalBonusesAndPayments = adjustments.length - totalCuts;
   return { rows, totalDeducted, totalAdded, totalCuts, totalBonusesAndPayments };
 }
 
-function vendorComparisonRows(days) {
+async function vendorComparisonRows(days) {
   const today = todayStr();
   const dates = lastNDates(days, today);
   const from = dates[0];
   const to = dates[dates.length - 1];
-  const vendors = db.prepare(`SELECT * FROM vendors ORDER BY is_direct DESC, name`).all();
-  const presentDays = db
-    .prepare(
+  const vendors = (await pool.query(`SELECT * FROM vendors ORDER BY is_direct DESC, name`, [])).rows;
+  const presentDays = (await pool.query(
       `SELECT w.vendor_id, COUNT(*) c FROM attendance a JOIN workers w ON w.id = a.worker_id
-       WHERE a.date BETWEEN ? AND ? AND a.hours_worked > 0 GROUP BY w.vendor_id`
-    )
-    .all(from, to)
+       WHERE a.date BETWEEN $1 AND $2 AND a.hours_worked > 0 GROUP BY w.vendor_id`
+    , [from, to])).rows
     .reduce((m, r) => ((m[r.vendor_id] = r.c), m), {});
 
-  const rows = vendors.map((v) => {
-    const workerCount = db.prepare('SELECT COUNT(*) c FROM workers WHERE vendor_id = ?').get(v.id).c;
-    const activeCount = db.prepare("SELECT COUNT(*) c FROM workers WHERE vendor_id = ? AND status = 'active'").get(v.id).c;
-    // Exclude flagged (superseded/voided) payroll runs from "Total paid" —
-    // same reasoning as the payroll cost trend chart above.
-    const totalPaid =
-      db
-        .prepare(
-          `SELECT COALESCE(SUM(pi.base_pay + pi.overtime_pay),0) - COALESCE((SELECT SUM(pd.amount) FROM payroll_deductions pd WHERE pd.payroll_item_id IN (SELECT pi3.id FROM payroll_items pi3 JOIN payroll_runs pr3 ON pr3.id = pi3.payroll_run_id WHERE pi3.vendor_id = ? AND pr3.flagged = 0)),0) total
-           FROM payroll_items pi JOIN payroll_runs pr ON pr.id = pi.payroll_run_id WHERE pi.vendor_id = ? AND pr.flagged = 0`
-        )
-        .get(v.id, v.id).total || 0;
-    const denom = activeCount * days;
-    const avgAttendance = denom > 0 ? Math.min(100, Math.round(((presentDays[v.id] || 0) / denom) * 1000) / 10) : null;
-    return Object.assign({}, v, { workerCount, activeCount, totalPaid, avgAttendance });
-  });
+  const rows = await Promise.all(
+    vendors.map(async (v) => {
+      const workerCount = (await pool.query('SELECT COUNT(*) c FROM workers WHERE vendor_id = $1', [v.id])).rows[0].c;
+      const activeCount = (await pool.query("SELECT COUNT(*) c FROM workers WHERE vendor_id = $1 AND status = 'active'", [v.id])).rows[0].c;
+      // Exclude flagged (superseded/voided) payroll runs from "Total paid" —
+      // same reasoning as the payroll cost trend chart above.
+      const totalPaid =
+        (
+          await pool.query(
+            `SELECT COALESCE(SUM(pi.base_pay + pi.overtime_pay),0) - COALESCE((SELECT SUM(pd.amount) FROM payroll_deductions pd WHERE pd.payroll_item_id IN (SELECT pi3.id FROM payroll_items pi3 JOIN payroll_runs pr3 ON pr3.id = pi3.payroll_run_id WHERE pi3.vendor_id = $1 AND pr3.flagged = 0)),0) total
+             FROM payroll_items pi JOIN payroll_runs pr ON pr.id = pi.payroll_run_id WHERE pi.vendor_id = $2 AND pr.flagged = 0`,
+            [v.id, v.id]
+          )
+        ).rows[0].total || 0;
+      const denom = activeCount * days;
+      const avgAttendance = denom > 0 ? Math.min(100, Math.round(((presentDays[v.id] || 0) / denom) * 1000) / 10) : null;
+      return Object.assign({}, v, { workerCount, activeCount, totalPaid, avgAttendance });
+    })
+  );
   const maxPaid = Math.max(...rows.map((r) => r.totalPaid), 0);
   return { rows, maxPaid };
 }
 
-function renderDashboard(user) {
+async function renderDashboard(user) {
   const today = todayStr();
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   const siteFilter = siteScopeClause('w.site_id', scope);
 
-  const totalWorkers = db.prepare(`SELECT COUNT(*) c FROM workers w WHERE status='active' ${siteFilter}`).get().c;
+  const totalWorkers = (await pool.query(`SELECT COUNT(*) c FROM workers w WHERE status='active' ${siteFilter}`, [])).rows[0].c;
 
-  const presentToday = db
-    .prepare(
+  const presentToday = (
+    await pool.query(
       `SELECT COUNT(DISTINCT a.worker_id) c FROM attendance a JOIN workers w ON w.id = a.worker_id
-       WHERE a.date = @today AND a.hours_worked > 0 ${siteFilter}`
+       WHERE a.date = $1 AND a.hours_worked > 0 ${siteFilter}`,
+      [today]
     )
-    .get({ today }).c;
+  ).rows[0].c;
 
-  const markedToday = db
-    .prepare(
+  const markedToday = (
+    await pool.query(
       `SELECT COUNT(DISTINCT a.worker_id) c FROM attendance a JOIN workers w ON w.id = a.worker_id
-       WHERE a.date = @today ${siteFilter}`
+       WHERE a.date = $1 ${siteFilter}`,
+      [today]
     )
-    .get({ today }).c;
+  ).rows[0].c;
 
-  const unassignedCount = db.prepare(`SELECT COUNT(*) c FROM workers WHERE status='active' AND site_id = ${POOL_SITE_ID}`).get().c;
+  const unassignedCount = (await pool.query(`SELECT COUNT(*) c FROM workers WHERE status='active' AND site_id = ${POOL_SITE_ID}`, [])).rows[0].c;
   const attendancePct = totalWorkers > 0 ? Math.round((presentToday / totalWorkers) * 100) : 0;
-  const sitesCount = db.prepare(`SELECT COUNT(*) c FROM sites WHERE id != ${POOL_SITE_ID}`).get().c;
+  const sitesCount = (await pool.query(`SELECT COUNT(*) c FROM sites WHERE id != ${POOL_SITE_ID}`, [])).rows[0].c;
   // v9.9: gated on the same capability the payroll-runs card and the
   // analytics link below are gated on, and only run for roles that can
   // actually see the result — was previously an unconditional query even
   // for roles the card never renders for.
   const canViewAnalytics = can(user, 'analytics.view');
-  const payrollRuns = canViewAnalytics ? db.prepare('SELECT COUNT(*) c FROM payroll_runs').get().c : 0;
+  const payrollRuns = canViewAnalytics ? (await pool.query('SELECT COUNT(*) c FROM payroll_runs', [])).rows[0].c : 0;
   const isSingleSite = user.role === 'supervisor';
 
   let siteBreakdown = '';
   if (!isSingleSite) {
     const siteRowScope = scope === null ? '' : siteScopeClause('s.id', scope);
-    const rows = db
-      .prepare(
+    const rows = (
+      await pool.query(
         `SELECT s.id, s.name, COUNT(DISTINCT w.id) worker_count,
-          COUNT(DISTINCT CASE WHEN a.date = @today AND a.hours_worked > 0 THEN a.worker_id END) present_today
+          COUNT(DISTINCT CASE WHEN a.date = $1 AND a.hours_worked > 0 THEN a.worker_id END) present_today
          FROM sites s
          LEFT JOIN workers w ON w.site_id = s.id AND w.status='active'
          LEFT JOIN attendance a ON a.worker_id = w.id AND a.site_id = s.id
          WHERE 1=1 ${siteRowScope}
-         GROUP BY s.id ORDER BY s.id`
+         GROUP BY s.id ORDER BY s.id`,
+        [today]
       )
-      .all({ today });
+    ).rows;
     siteBreakdown = `
     <h2>Sites overview</h2>
     <div class="table-wrap"><table>
@@ -751,7 +755,7 @@ function renderDashboard(user) {
       !isSingleSite
         ? `<div class="stat"><div class="stat-label">Sites</div><div class="stat-value">${sitesCount}</div></div>`
         : `<div class="stat"><div class="stat-label">Your site</div><div class="stat-value" style="font-size:16px">${esc(
-            (db.prepare('SELECT name FROM sites WHERE id=?').get(user.site_id) || {}).name || '—'
+            ((await pool.query('SELECT name FROM sites WHERE id=$1', [user.site_id])).rows[0] || {}).name || '—'
           )}</div></div>`
     }
   </div>
@@ -773,12 +777,12 @@ function renderDashboard(user) {
   `;
 }
 
-function renderAnalyticsSection() {
+async function renderAnalyticsSection() {
   const TREND_DAYS = 14;
-  const { chart: attendanceChart, omitted } = attendanceTrendChart(TREND_DAYS);
-  const payrollChart = payrollCostTrendChart(10);
-  const { rows: adjustmentRows, totalDeducted, totalAdded, totalCuts, totalBonusesAndPayments } = performanceAdjustmentImpact();
-  const { rows: vendorRows, maxPaid } = vendorComparisonRows(TREND_DAYS);
+  const { chart: attendanceChart, omitted } = await attendanceTrendChart(TREND_DAYS);
+  const payrollChart = await payrollCostTrendChart(10);
+  const { rows: adjustmentRows, totalDeducted, totalAdded, totalCuts, totalBonusesAndPayments } = await performanceAdjustmentImpact();
+  const { rows: vendorRows, maxPaid } = await vendorComparisonRows(TREND_DAYS);
 
   return `
   <h2>Attendance % by site — last ${TREND_DAYS} days</h2>
@@ -840,7 +844,7 @@ function renderAnalyticsSection() {
 }
 
 // ---------- Workers ----------
-function workerRowsForUser(user, siteFilterId, opts) {
+async function workerRowsForUser(user, siteFilterId, opts) {
   const o = opts || {};
   let sql = `SELECT w.*, s.name site_name, v.name vendor_name, v.is_direct vendor_is_direct, wt.name type_name
              FROM workers w
@@ -848,35 +852,36 @@ function workerRowsForUser(user, siteFilterId, opts) {
              LEFT JOIN vendors v ON v.id = w.vendor_id
              LEFT JOIN worker_types wt ON wt.id = w.worker_type_id
              WHERE 1=1`;
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   sql += siteScopeClause('w.site_id', scope);
-  const params = {};
+  const params = [];
   if (scope === null && siteFilterId) {
-    sql += ' AND w.site_id = @siteId';
-    params.siteId = siteFilterId;
+    params.push(siteFilterId);
+    sql += ` AND w.site_id = $${params.length}`;
   }
   if (o.q) {
-    sql += ' AND (w.name LIKE @q OR w.worker_code LIKE @q)';
-    params.q = `%${o.q}%`;
+    params.push(`%${o.q}%`);
+    sql += ` AND (w.name LIKE $${params.length} OR w.worker_code LIKE $${params.length})`;
   }
   const countSql = sql.replace(/^SELECT w\.\*.*?FROM/s, 'SELECT COUNT(*) c FROM');
-  const totalCount = db.prepare(countSql).get(params).c;
+  const totalCount = (await pool.query(countSql, params)).rows[0].c;
   sql += ' ORDER BY w.name';
   if (o.limit) {
-    sql += ' LIMIT @limit OFFSET @offset';
-    params.limit = o.limit;
-    params.offset = o.offset || 0;
+    params.push(o.limit);
+    sql += ` LIMIT $${params.length}`;
+    params.push(o.offset || 0);
+    sql += ` OFFSET $${params.length}`;
   }
-  return { rows: db.prepare(sql).all(params), totalCount };
+  return { rows: (await pool.query(sql, params)).rows, totalCount };
 }
 
-function renderWorkersList(user, query) {
+async function renderWorkersList(user, query) {
   const siteFilterId = query.site_id || '';
   const q = (query.q || '').trim();
   const page = pageFromQuery(query);
-  const { rows: workers, totalCount } = workerRowsForUser(user, siteFilterId, { q, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE });
+  const { rows: workers, totalCount } = await workerRowsForUser(user, siteFilterId, { q, limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE });
   const canEdit = WORKER_MANAGE_ROLES.includes(user.role);
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   const qsBase = `/workers?${siteFilterId ? 'site_id=' + esc(siteFilterId) + '&' : ''}${q ? 'q=' + esc(encodeURIComponent(q)) + '&' : ''}`.replace(/[&?]$/, '');
   return `
   <h1>Workers</h1>
@@ -886,7 +891,7 @@ function renderWorkersList(user, query) {
     <div><label>Search by name or ID</label><input name="q" value="${esc(q)}" placeholder="e.g. Ravi or W00012"></div>
     ${
       scope === null
-        ? `<div><label>Site</label><select name="site_id">${'<option value="">All sites</option>' + siteOptions(siteFilterId)}</select></div>`
+        ? `<div><label>Site</label><select name="site_id">${'<option value="">All sites</option>' + await siteOptions(siteFilterId)}</select></div>`
         : ''
     }
     <div style="align-self:flex-end"><button class="btn secondary" type="submit" style="margin-bottom:14px">Filter</button></div>
@@ -916,14 +921,14 @@ function renderWorkersList(user, query) {
   `;
 }
 
-function renderWorkerForm(worker, opts) {
+async function renderWorkerForm(worker, opts) {
   const w = Object.assign({}, worker, (opts && opts.values) || {});
   const isEdit = !!worker;
   const canVerify = !!(opts && opts.user && WORKER_VERIFY_ROLES.includes(opts.user.role));
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
-  const directId = directVendorId();
+  const directId = await directVendorId();
   const isAlreadyDirect = isEdit && Number(worker.vendor_id) === Number(directId);
-  const hist = isEdit ? workerHistoryCounts(worker.id) : { attendance: 0, payrollItems: 0 };
+  const hist = isEdit ? await workerHistoryCounts(worker.id) : { attendance: 0, payrollItems: 0 };
   const hasHistory = hist.attendance > 0 || hist.payrollItems > 0;
 
   return `
@@ -940,12 +945,12 @@ function renderWorkerForm(worker, opts) {
   <form method="POST" action="${isEdit ? '/workers/' + worker.id : '/workers'}">
     <div class="form-row">
       <div><label>Full name</label><input name="name" required value="${esc(w.name)}"></div>
-      <div><label>Worker type</label><select name="worker_type_id" required><option value="">Select type…</option>${workerTypeOptions(
+      <div><label>Worker type</label><select name="worker_type_id" required><option value="">Select type…</option>${await workerTypeOptions(
         w.worker_type_id
       )}</select></div>
     </div>
     <div class="form-row">
-      <div><label>Vendor</label><select name="vendor_id" required><option value="">Select vendor…</option>${vendorOptions(
+      <div><label>Vendor</label><select name="vendor_id" required><option value="">Select vendor…</option>${await vendorOptions(
         w.vendor_id
       )}</select></div>
       <div><label>Skill grade</label><select name="skill_grade">${skillGradeOptions(w.skill_grade)}</select></div>
@@ -964,7 +969,7 @@ function renderWorkerForm(worker, opts) {
     ${
       isEdit
         ? `<div class="form-row">
-            <div><label>Site</label><select name="site_id" required>${siteOptions(w.site_id)}</select></div>
+            <div><label>Site</label><select name="site_id" required>${await siteOptions(w.site_id)}</select></div>
             <div><label>Status</label>
               <select name="status">
                 <option value="active" ${w.status === 'active' || !w.status ? 'selected' : ''}>Active</option>
@@ -1031,18 +1036,43 @@ function renderWorkerForm(worker, opts) {
 }
 
 // ---------- Vendors ----------
-function renderVendors(opts) {
+async function renderVendors(opts) {
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
   const v0 = (opts && opts.values) || {};
   const page = (opts && opts.page) || 1;
-  const totalCount = db.prepare('SELECT COUNT(*) c FROM vendors').get().c;
-  const vendors = db
-    .prepare(
+  const totalCount = (await pool.query('SELECT COUNT(*) c FROM vendors', [])).rows[0].c;
+  const vendors = (await pool.query(
       `SELECT v.*, (SELECT COUNT(*) FROM workers w WHERE w.vendor_id = v.id) worker_count,
         (SELECT COUNT(*) FROM workers w WHERE w.vendor_id = v.id AND w.status='active') active_worker_count
-       FROM vendors v ORDER BY v.is_direct DESC, v.name LIMIT ? OFFSET ?`
+       FROM vendors v ORDER BY v.is_direct DESC, v.name LIMIT $1 OFFSET $2`
+    , [PAGE_SIZE, (page - 1) * PAGE_SIZE])).rows;
+  const vendorRowsHtml = (
+    await Promise.all(
+      vendors.map(async (v) => {
+        const deps = await vendorDependencyCounts(v.id);
+        const canHardDelete = deps.workers === 0 && deps.payrollItems === 0;
+        return `<tr>
+        <td>${esc(v.vendor_code)}</td>
+        <td>${esc(v.name)}${v.is_direct ? ' <span class="badge active">Direct</span>' : ''}</td>
+        <td>${esc(v.contact || '—')}</td>
+        <td>${v.worker_count}${v.active_worker_count !== v.worker_count ? ` (${v.active_worker_count} active)` : ''}</td>
+        <td><span class="badge ${v.active ? 'active' : 'inactive'}">${v.active ? 'active' : 'deactivated'}</span></td>
+        <td>
+          <a href="/vendors/${v.id}/edit">Edit</a>
+          ${
+            v.is_direct
+              ? ''
+              : canHardDelete
+              ? ` · <form class="inline" method="POST" action="/vendors/${v.id}/delete" onsubmit="return confirm('Delete this vendor? It has no workers or payroll history, so this is permanent.')"><button class="btn danger small" type="submit">Delete</button></form>`
+              : ` · <form class="inline" method="POST" action="/vendors/${v.id}/toggle-active" onsubmit="return confirm('${
+                  v.active ? 'Deactivate' : 'Reactivate'
+                } this vendor?')"><button class="btn secondary small" type="submit">${v.active ? 'Deactivate' : 'Reactivate'}</button></form>`
+          }
+        </td>
+      </tr>`;
+      })
     )
-    .all(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+  ).join('');
   return `
   <h1>Vendors</h1>
   <p class="subtitle">Payments for vendor-supplied workers route to the vendor. Direct BilaraGroup workers use the built-in "Direct" vendor.</p>
@@ -1071,44 +1101,18 @@ function renderVendors(opts) {
   </div>
   <div class="table-wrap"><table>
     <tr><th>Code</th><th>Name</th><th>Contact</th><th>Workers</th><th>Status</th><th></th></tr>
-    ${vendors
-      .map((v) => {
-        const deps = vendorDependencyCounts(v.id);
-        const canHardDelete = deps.workers === 0 && deps.payrollItems === 0;
-        return `<tr>
-        <td>${esc(v.vendor_code)}</td>
-        <td>${esc(v.name)}${v.is_direct ? ' <span class="badge active">Direct</span>' : ''}</td>
-        <td>${esc(v.contact || '—')}</td>
-        <td>${v.worker_count}${v.active_worker_count !== v.worker_count ? ` (${v.active_worker_count} active)` : ''}</td>
-        <td><span class="badge ${v.active ? 'active' : 'inactive'}">${v.active ? 'active' : 'deactivated'}</span></td>
-        <td>
-          <a href="/vendors/${v.id}/edit">Edit</a>
-          ${
-            v.is_direct
-              ? ''
-              : canHardDelete
-              ? ` · <form class="inline" method="POST" action="/vendors/${v.id}/delete" onsubmit="return confirm('Delete this vendor? It has no workers or payroll history, so this is permanent.')"><button class="btn danger small" type="submit">Delete</button></form>`
-              : ` · <form class="inline" method="POST" action="/vendors/${v.id}/toggle-active" onsubmit="return confirm('${
-                  v.active ? 'Deactivate' : 'Reactivate'
-                } this vendor?')"><button class="btn secondary small" type="submit">${v.active ? 'Deactivate' : 'Reactivate'}</button></form>`
-          }
-        </td>
-      </tr>`;
-      })
-      .join('')}
+    ${vendorRowsHtml}
   </table></div>
   ${paginationControls('/vendors', page, totalCount, PAGE_SIZE)}
   <p class="hint">A vendor with workers or payroll history attached can't be permanently deleted — it can only be deactivated (so it stops appearing for new assignments) after its workers are reassigned or marked inactive. Open a vendor's Edit page to manage its workers.</p>
   `;
 }
 
-function renderVendorForm(vendor, opts) {
+async function renderVendorForm(vendor, opts) {
   const v = Object.assign({}, vendor, (opts && opts.values) || {});
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
-  const deps = vendorDependencyCounts(vendor.id);
-  const activeWorkers = db
-    .prepare(`SELECT w.id, w.name FROM workers w WHERE w.vendor_id = ? AND w.status = 'active' ORDER BY w.name`)
-    .all(vendor.id);
+  const deps = await vendorDependencyCounts(vendor.id);
+  const activeWorkers = (await pool.query(`SELECT w.id, w.name FROM workers w WHERE w.vendor_id = $1 AND w.status = 'active' ORDER BY w.name`, [vendor.id])).rows;
 
   return `
   <h1>Edit vendor</h1>
@@ -1168,7 +1172,7 @@ function renderVendorForm(vendor, opts) {
     <h2 class="mt-0" style="margin-top:0">Absorb into another vendor (bulk reassign)</h2>
     <form method="POST" action="/vendors/${vendor.id}/reassign-workers">
       <label>Move all ${activeWorkers.length} active worker(s) to</label>
-      <select name="target_vendor_id" required><option value="">Select vendor…</option>${vendorOptions(null, { excludeId: vendor.id })}</select>
+      <select name="target_vendor_id" required><option value="">Select vendor…</option>${await vendorOptions(null, { excludeId: vendor.id })}</select>
       <button class="btn secondary" type="submit">Reassign all workers</button>
     </form>
   </div>
@@ -1186,12 +1190,10 @@ function renderVendorForm(vendor, opts) {
 }
 
 // ---------- Worker types ----------
-function renderWorkerTypes() {
-  const types = db
-    .prepare(
+async function renderWorkerTypes() {
+  const types = (await pool.query(
       `SELECT t.*, (SELECT COUNT(*) FROM workers w WHERE w.worker_type_id = t.id) worker_count FROM worker_types t ORDER BY t.name`
-    )
-    .all();
+    , [])).rows;
   return `
   <h1>Worker types</h1>
   <p class="subtitle">Manage the list of worker types (Mason, Helper, Tile Worker, …) available when adding a worker.</p>
@@ -1229,11 +1231,9 @@ function renderWorkerTypes() {
 // into the worker form. Categories are scoped per worker type (admin-managed,
 // same soft-disable pattern as worker_types) and ratings use the same
 // trainee/skilled/expert scale as the existing overall skill_grade.
-function skillCategoriesForType(workerTypeId, opts) {
+async function skillCategoriesForType(workerTypeId, opts) {
   const activeOnly = !opts || opts.activeOnly !== false;
-  return db
-    .prepare(`SELECT * FROM skill_categories WHERE worker_type_id = ? ${activeOnly ? 'AND active = 1' : ''} ORDER BY name`)
-    .all(workerTypeId);
+  return (await pool.query(`SELECT * FROM skill_categories WHERE worker_type_id = $1 ${activeOnly ? 'AND active = 1' : ''} ORDER BY name`, [workerTypeId])).rows;
 }
 
 // Category management moved to its own page (/skill-assessments/categories,
@@ -1241,12 +1241,10 @@ function skillCategoriesForType(workerTypeId, opts) {
 // skills exist per worker type) doesn't belong glued onto the daily "rate a
 // worker" workflow. Same pattern as /worker-types already being separate
 // from /workers, extended here for consistency.
-function renderSkillCategories(user, opts) {
+async function renderSkillCategories(user, opts) {
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
-  const workerTypes = db.prepare('SELECT * FROM worker_types WHERE active = 1 ORDER BY name').all();
-  const allCategories = db
-    .prepare(`SELECT sc.*, wt.name type_name FROM skill_categories sc JOIN worker_types wt ON wt.id = sc.worker_type_id ORDER BY wt.name, sc.name`)
-    .all();
+  const workerTypes = (await pool.query('SELECT * FROM worker_types WHERE active = 1 ORDER BY name', [])).rows;
+  const allCategories = (await pool.query(`SELECT sc.*, wt.name type_name FROM skill_categories sc JOIN worker_types wt ON wt.id = sc.worker_type_id ORDER BY wt.name, sc.name`, [])).rows;
   const byType = {};
   allCategories.forEach((c) => {
     (byType[c.worker_type_id] = byType[c.worker_type_id] || []).push(c);
@@ -1258,7 +1256,7 @@ function renderSkillCategories(user, opts) {
   <div class="card">
     <form method="POST" action="/skill-assessments/categories">
       <div class="form-row">
-        <div><label>Worker type</label><select name="worker_type_id" required><option value="">Select type…</option>${workerTypeOptions(
+        <div><label>Worker type</label><select name="worker_type_id" required><option value="">Select type…</option>${await workerTypeOptions(
           (opts && opts.selectedType) || ''
         )}</select></div>
         <div><label>New category name</label><input name="name" required placeholder="e.g. Brickwork"></div>
@@ -1297,12 +1295,12 @@ function renderSkillCategories(user, opts) {
   `;
 }
 
-function renderSkillAssessments(user, query, opts) {
+async function renderSkillAssessments(user, query, opts) {
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
   const savedHtml = opts && opts.saved ? `<div class="flash flash-success">Saved ratings for ${esc(opts.saved)}.</div>` : '';
   const canManageCategories = can(user, 'skillcategories.manage');
 
-  const workerTypes = db.prepare('SELECT * FROM worker_types WHERE active = 1 ORDER BY name').all();
+  const workerTypes = (await pool.query('SELECT * FROM worker_types WHERE active = 1 ORDER BY name', [])).rows;
 
   const manageCategoriesLinkHtml = canManageCategories
     ? `<h2 style="margin-top:0"><a href="/skill-assessments/categories">Manage skill categories →</a></h2>`
@@ -1314,30 +1312,29 @@ function renderSkillAssessments(user, query, opts) {
   let workerSql = `SELECT w.*, wt.name type_name, s.name site_name FROM workers w
      LEFT JOIN worker_types wt ON wt.id = w.worker_type_id LEFT JOIN sites s ON s.id = w.site_id
      WHERE w.status = 'active'`;
-  const params = {};
+  const params = [];
   if (q) {
-    workerSql += ' AND (w.name LIKE @q OR w.worker_code LIKE @q)';
-    params.q = `%${q}%`;
+    params.push(`%${q}%`);
+    workerSql += ` AND (w.name LIKE $${params.length} OR w.worker_code LIKE $${params.length})`;
   }
   if (typeFilter) {
-    workerSql += ' AND w.worker_type_id = @typeFilter';
-    params.typeFilter = typeFilter;
+    params.push(typeFilter);
+    workerSql += ` AND w.worker_type_id = $${params.length}`;
   }
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   workerSql += siteScopeClause('w.site_id', scope);
   workerSql += ' ORDER BY w.name LIMIT 100';
-  const workers = db.prepare(workerSql).all(params);
+  const workers = (await pool.query(workerSql, params)).rows;
 
   const selectedWorkerId = query.worker_id || '';
-  const selectedWorker = selectedWorkerId ? db.prepare('SELECT * FROM workers WHERE id = ?').get(selectedWorkerId) : null;
+  const selectedWorker = selectedWorkerId ? (await pool.query('SELECT * FROM workers WHERE id = $1', [selectedWorkerId])).rows[0] : null;
 
   // ---- Rating form for the selected worker ----
   let ratingFormHtml = '';
   if (selectedWorker) {
-    const cats = skillCategoriesForType(selectedWorker.worker_type_id);
+    const cats = await skillCategoriesForType(selectedWorker.worker_type_id);
     const existing = {};
-    db.prepare('SELECT * FROM worker_skill_ratings WHERE worker_id = ?')
-      .all(selectedWorker.id)
+    (await pool.query('SELECT * FROM worker_skill_ratings WHERE worker_id = $1', [selectedWorker.id])).rows
       .forEach((r) => (existing[r.skill_category_id] = r.rating));
     const typeName = (workerTypes.find((t) => t.id === selectedWorker.worker_type_id) || {}).name || '—';
     ratingFormHtml = `
@@ -1385,7 +1382,7 @@ function renderSkillAssessments(user, query, opts) {
   <div class="card">
     <form method="GET" action="/skill-assessments" class="form-row" style="flex-wrap:wrap">
       <div><label>Search by name or ID</label><input name="q" value="${esc(q)}" placeholder="e.g. Ravi or W00012"></div>
-      <div><label>Worker type</label><select name="worker_type_id"><option value="">All types</option>${workerTypeOptions(
+      <div><label>Worker type</label><select name="worker_type_id"><option value="">All types</option>${await workerTypeOptions(
         typeFilter
       )}</select></div>
       <div style="align-self:flex-end"><button class="btn secondary" type="submit" style="margin-bottom:14px">Filter</button></div>
@@ -1396,28 +1393,31 @@ function renderSkillAssessments(user, query, opts) {
   <h2 style="margin-top:0">Workers${typeFilter ? ` · ${esc((workerTypes.find((t) => String(t.id) === String(typeFilter)) || {}).name || '')}` : ''}</h2>
   <div class="table-wrap"><table>
     <tr><th>ID</th><th>Name</th><th>Type</th><th>Site</th><th>Overall grade</th><th></th></tr>
-    ${workers
-      .map((w) => {
-        const catCount = skillCategoriesForType(w.worker_type_id).length;
-        const ratedCount = catCount
-          ? db
-              .prepare(
-                `SELECT COUNT(*) c FROM worker_skill_ratings wsr JOIN skill_categories sc ON sc.id = wsr.skill_category_id WHERE wsr.worker_id = ? AND sc.active = 1`
-              )
-              .get(w.id).c
-          : 0;
-        return `<tr ${String(w.id) === String(selectedWorkerId) ? 'style="background:var(--bg-muted, #f4f4f8)"' : ''}>
+    ${(
+      await Promise.all(
+        workers.map(async (w) => {
+          const catCount = (await skillCategoriesForType(w.worker_type_id)).length;
+          const ratedCount = catCount
+            ? (
+                await pool.query(
+                  `SELECT COUNT(*) c FROM worker_skill_ratings wsr JOIN skill_categories sc ON sc.id = wsr.skill_category_id WHERE wsr.worker_id = $1 AND sc.active = 1`,
+                  [w.id]
+                )
+              ).rows[0].c
+            : 0;
+          return `<tr ${String(w.id) === String(selectedWorkerId) ? 'style="background:var(--bg-muted, #f4f4f8)"' : ''}>
         <td class="muted">${esc(w.worker_code || '—')}</td>
         <td>${esc(w.name)}</td>
         <td>${esc(w.type_name || '—')}</td>
         <td>${w.site_id === POOL_SITE_ID ? '<span class="badge inactive">100 — Pool</span>' : `${w.site_id} — ${esc(w.site_name || '—')}`}</td>
         <td>${catCount ? `<span class="muted">${ratedCount}/${catCount} rated</span>` : '<span class="muted">no categories</span>'}</td>
         <td><a class="btn secondary small" href="/skill-assessments?worker_id=${w.id}&q=${encodeURIComponent(q)}&worker_type_id=${esc(
-          typeFilter
-        )}">Rate skills</a></td>
+            typeFilter
+          )}">Rate skills</a></td>
       </tr>`;
-      })
-      .join('')}
+        })
+      )
+    ).join('')}
     ${workers.length === 0 ? '<tr><td colspan="6" class="muted">No active workers match.</td></tr>' : ''}
   </table></div>
   ${workers.length === 100 ? '<p class="hint">Showing the first 100 matching workers — narrow your search to find someone specific.</p>' : ''}
@@ -1432,18 +1432,15 @@ function attendanceLabel(row) {
   return `<span class="badge absent">Absent</span>`;
 }
 
-function renderAttendance(user, query) {
+async function renderAttendance(user, query) {
   const date = query.date || todayStr();
   const siteId = user.role === 'supervisor' ? user.site_id : query.site_id || '';
 
   let gridHtml = '';
   if (siteId) {
-    const workers = db
-      .prepare(`SELECT * FROM workers WHERE status='active' AND site_id = ? ORDER BY name`)
-      .all(siteId);
+    const workers = (await pool.query(`SELECT * FROM workers WHERE status='active' AND site_id = $1 ORDER BY name`, [siteId])).rows;
     const existing = {};
-    db.prepare(`SELECT * FROM attendance WHERE date = ? AND site_id = ?`)
-      .all(date, siteId)
+    (await pool.query(`SELECT * FROM attendance WHERE date = $1 AND site_id = $2`, [date, siteId])).rows
       .forEach((a) => (existing[a.worker_id] = a));
 
     const rows = workers
@@ -1494,12 +1491,12 @@ function renderAttendance(user, query) {
   const siteSelector =
     user.role === 'supervisor'
       ? ''
-      : `<div><label>Site</label><select name="site_id" onchange="this.form.submit()"><option value="">Choose a site…</option>${siteOptions(
+      : `<div><label>Site</label><select name="site_id" onchange="this.form.submit()"><option value="">Choose a site…</option>${await siteOptions(
           siteId,
           { activeOnly: true }
         )}</select></div>`;
 
-  const blockedNotice = noEligibleSiteNotice(user);
+  const blockedNotice = await noEligibleSiteNotice(user);
   if (blockedNotice) {
     return `
   <h1>Mark attendance</h1>
@@ -1528,7 +1525,7 @@ function renderAttendance(user, query) {
 // exactly one form on it; posts to the same /attendance/entry handler the form
 // always used, so validation, the supervisor site clamp, and the upsert are
 // unchanged and defined in exactly one place.
-function renderSingleEntry(user, query, opts) {
+async function renderSingleEntry(user, query, opts) {
   const o = opts || {};
   const values = o.values || {};
   const date = values.date || query.date || todayStr();
@@ -1542,9 +1539,7 @@ function renderSingleEntry(user, query, opts) {
   // recording a visiting worker at your own site is legitimate (that's the
   // split-site case), but it shouldn't be an accident, so it's a deliberate
   // pick from a labelled group rather than one flat list.
-  const activeWorkers = db
-    .prepare(`SELECT w.id, w.name, w.site_id, s.name site_name FROM workers w LEFT JOIN sites s ON s.id = w.site_id WHERE w.status='active' ORDER BY w.name`)
-    .all();
+  const activeWorkers = (await pool.query(`SELECT w.id, w.name, w.site_id, s.name site_name FROM workers w LEFT JOIN sites s ON s.id = w.site_id WHERE w.status='active' ORDER BY w.name`, [])).rows;
   // data-home/-id let the visiting-worker note below compare a selected
   // worker's home site against whatever site the form is currently set to,
   // client-side, without a round trip — same "the form only offers what the
@@ -1556,7 +1551,7 @@ function renderSingleEntry(user, query, opts) {
       String(values.worker_id || '') === String(w.id) ? 'selected' : ''
     }>${esc(w.name)} — ${w.site_id === POOL_SITE_ID ? 'Unassigned Pool' : `site ${w.site_id}`}</option>`;
   };
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   let workerOptionsHtml;
   if (scope === null) {
     workerOptionsHtml = activeWorkers.map(workerOption).join('');
@@ -1570,7 +1565,7 @@ function renderSingleEntry(user, query, opts) {
         : '');
   }
 
-  const blockedNotice = noEligibleSiteNotice(user);
+  const blockedNotice = await noEligibleSiteNotice(user);
   if (blockedNotice) {
     return `
   <h1>Add single attendance entry</h1>
@@ -1587,7 +1582,7 @@ function renderSingleEntry(user, query, opts) {
     <form method="POST" action="/attendance/entry">
       <div class="form-row">
         <div><label>Worker</label><select name="worker_id" id="single-entry-worker" required><option value="">Select worker…</option>${workerOptionsHtml}</select></div>
-        <div><label>Site worked at</label><select name="site_id" id="single-entry-site" required><option value="">Select site…</option>${siteOptions(
+        <div><label>Site worked at</label><select name="site_id" id="single-entry-site" required><option value="">Select site…</option>${await siteOptions(
           values.site_id || undefined,
           { activeOnly: true, onlyIds: scope === null ? undefined : scope }
         )}</select></div>
@@ -1616,20 +1611,20 @@ function renderSingleEntry(user, query, opts) {
 // A site can be marked off for a date so payroll excludes it — an occasional
 // setup task, deliberately its own page rather than a card bolted onto the
 // daily "Mark attendance" workflow (see renderAttendance's link to here).
-function renderSiteOff(user, query) {
+async function renderSiteOff(user, query) {
   const date = query.date || todayStr();
   const siteId = user.role === 'supervisor' ? user.site_id : query.site_id || '';
 
   const siteSelector =
     user.role === 'supervisor'
       ? ''
-      : `<div><label>Site</label><select name="site_id" onchange="this.form.submit()"><option value="">Choose a site…</option>${siteOptions(
+      : `<div><label>Site</label><select name="site_id" onchange="this.form.submit()"><option value="">Choose a site…</option>${await siteOptions(
           siteId
         )}</select></div>`;
 
   let bodyHtml = '';
   if (siteId) {
-    const offDays = db.prepare('SELECT * FROM site_off_days WHERE site_id = ? ORDER BY date DESC LIMIT 20').all(siteId);
+    const offDays = (await pool.query('SELECT * FROM site_off_days WHERE site_id = $1 ORDER BY date DESC LIMIT 20', [siteId])).rows;
     const alreadyOffToday = offDays.some((o) => o.date === date);
     bodyHtml = `
     <div class="card">
@@ -1673,37 +1668,38 @@ function renderSiteOff(user, query) {
   `;
 }
 
-function attendanceHistoryRows(user, query) {
+async function attendanceHistoryRows(user, query) {
   const from = query.from || todayStr();
   const to = query.to || todayStr();
-  const scope = siteScopeForUser(user);
+  const scope = await siteScopeForUser(user);
   const isSingleSite = scope !== null && scope.length <= 1;
   const siteFilterId = isSingleSite ? scope[0] || '' : query.site_id || '';
   let siteFilter;
   if (scope !== null) {
     // Restricted user (supervisor: 1 site; PM/site engineer: their assigned
     // sites) — further narrow by their own site_id filter dropdown if picked,
-    // but never outside their scope. @siteId is always referenced (even when
-    // unused) since node:sqlite rejects a bound param the query text doesn't
-    // mention.
-    siteFilter = siteScopeClause('a.site_id', scope) + ' AND (@siteId IS NULL OR a.site_id = @siteId)';
+    // but never outside their scope. Postgres (unlike node:sqlite) has no
+    // objection to a bound param the query text doesn't reference, but $3 is
+    // referenced here regardless.
+    siteFilter = siteScopeClause('a.site_id', scope) + ' AND ($3::int IS NULL OR a.site_id = $3::int)';
   } else {
-    siteFilter = siteFilterId ? 'AND a.site_id = @siteId' : 'AND (@siteId IS NULL OR 1=1)';
+    siteFilter = siteFilterId ? 'AND a.site_id = $3::int' : 'AND ($3::int IS NULL OR 1=1)';
   }
-  const rows = db
-    .prepare(
+  const rows = (
+    await pool.query(
       `SELECT a.*, w.name worker_name, s.name site_name FROM attendance a
        JOIN workers w ON w.id = a.worker_id
        LEFT JOIN sites s ON s.id = a.site_id
-       WHERE a.date BETWEEN @from AND @to ${siteFilter}
-       ORDER BY a.date DESC, s.name, w.name`
+       WHERE a.date BETWEEN $1 AND $2 ${siteFilter}
+       ORDER BY a.date DESC, s.name, w.name`,
+      [from, to, siteFilterId || null]
     )
-    .all({ from, to, siteId: siteFilterId || null });
+  ).rows;
   return { from, to, scope, isSingleSite, siteFilterId, rows };
 }
 
-function renderAttendanceHistory(user, query) {
-  const { from, to, scope, isSingleSite, siteFilterId, rows } = attendanceHistoryRows(user, query);
+async function renderAttendanceHistory(user, query) {
+  const { from, to, scope, isSingleSite, siteFilterId, rows } = await attendanceHistoryRows(user, query);
   // Only roles that can actually delete an entry get the × column — everyone
   // else gets a clean read-only table instead of a button that would 403.
   const canDelete = can(user, 'attendance.delete');
@@ -1737,7 +1733,7 @@ function renderAttendanceHistory(user, query) {
     ${
       !isSingleSite
         ? `<div><label>Site</label><select name="site_id">${
-            '<option value="">All sites</option>' + siteOptions(siteFilterId, scope !== null ? { onlyIds: scope } : {})
+            '<option value="">All sites</option>' + await siteOptions(siteFilterId, scope !== null ? { onlyIds: scope } : {})
           }</select></div>`
         : ''
     }
@@ -1801,18 +1797,16 @@ function renderAttendanceHistory(user, query) {
 const PAYROLL_STATUS_LABEL = { pending_verification: 'Pending verification', verified: 'Verified', completed: 'Completed' };
 const PAYROLL_STATUS_BADGE = { pending_verification: 'half_day', verified: 'active', completed: 'active' };
 
-function renderPayrollList(user, query) {
+async function renderPayrollList(user, query) {
   const page = pageFromQuery(query || {});
-  const totalCount = db.prepare('SELECT COUNT(*) c FROM payroll_runs').get().c;
-  const runs = db
-    .prepare(
+  const totalCount = (await pool.query('SELECT COUNT(*) c FROM payroll_runs', [])).rows[0].c;
+  const runs = (await pool.query(
       `SELECT pr.*, u.name generated_by_name,
         (SELECT COALESCE(SUM(pi.base_pay + pi.overtime_pay),0) - COALESCE((SELECT SUM(pd.amount) FROM payroll_deductions pd JOIN payroll_items pi2 ON pi2.id = pd.payroll_item_id WHERE pi2.payroll_run_id = pr.id),0)
          FROM payroll_items pi WHERE pi.payroll_run_id = pr.id) total
        FROM payroll_runs pr LEFT JOIN users u ON u.id = pr.generated_by
-       ORDER BY pr.generated_at DESC LIMIT ? OFFSET ?`
-    )
-    .all(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+       ORDER BY pr.generated_at DESC LIMIT $1 OFFSET $2`
+    , [PAGE_SIZE, (page - 1) * PAGE_SIZE])).rows;
   const canGenerate = PAYROLL_GENERATE_ROLES.includes(user.role);
   return `
   <h1>Payroll</h1>
@@ -1872,154 +1866,161 @@ function renderPayrollNew(opts) {
 // Site performance adjustments (cut / bonus / additional_payment) logged for
 // a site whose date range overlaps the given payroll period. Standard
 // interval-overlap check: row.start <= period.end AND row.end >= period.start.
-function sitePerformanceAdjustmentsFor(siteId, periodStart, periodEnd) {
-  return db.prepare(`SELECT * FROM site_performance WHERE site_id = ? AND period_start <= ? AND period_end >= ? ORDER BY id`).all(siteId, periodEnd, periodStart);
+async function sitePerformanceAdjustmentsFor(siteId, periodStart, periodEnd, client) {
+  const runner = client || pool;
+  return (
+    await runner.query(`SELECT * FROM site_performance WHERE site_id = $1 AND period_start <= $2 AND period_end >= $3 ORDER BY id`, [
+      siteId,
+      periodEnd,
+      periodStart,
+    ])
+  ).rows;
 }
 
-function generatePayroll({ period_start, period_end, notes }, userId) {
-  const info = db
-    .prepare('INSERT INTO payroll_runs (period_start, period_end, generated_by, notes) VALUES (?, ?, ?, ?)')
-    .run(period_start, period_end, userId, notes || null);
-  const runId = info.lastInsertRowid;
+// Wrapped in a single transaction (a genuine improvement over the old
+// synchronous-SQLite version, which relied on single-threaded execution for
+// atomicity): a mid-function failure — a bad query, a lost connection —
+// rolls back the whole run instead of leaving a half-generated payroll run
+// with some workers' items written and others missing.
+async function generatePayroll({ period_start, period_end, notes }, userId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-  // Dates a site was marked "off" within (or overlapping) this period — that
-  // site+date is excluded from pay entirely, no matter what was logged.
-  const offDays = db.prepare(`SELECT site_id, date FROM site_off_days WHERE date BETWEEN ? AND ?`).all(period_start, period_end);
-  const offSet = new Set(offDays.map((o) => `${o.site_id}:${o.date}`));
+    const runResult = await client.query(
+      'INSERT INTO payroll_runs (period_start, period_end, generated_by, notes, generated_at) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [period_start, period_end, userId, notes || null, nowSqliteStyle()]
+    );
+    const runId = runResult.rows[0].id;
 
-  const workers = db.prepare(`SELECT * FROM workers WHERE status = 'active'`).all();
-  const insertItem = db.prepare(
-    `INSERT INTO payroll_items (payroll_run_id, worker_id, vendor_id, days_present, leave_hours, hours_worked, overtime_hours, base_pay, overtime_pay)
-     VALUES (@runId, @workerId, @vendorId, @daysPresent, @leaveHours, @hoursWorked, @overtimeHours, @basePay, @overtimePay)`
-  );
-  const insertDeduction = db.prepare(`INSERT INTO payroll_deductions (payroll_item_id, reason, amount) VALUES (?, ?, ?)`);
-  const insertItemSite = db.prepare(
-    `INSERT INTO payroll_item_sites (payroll_item_id, site_id, hours_worked, overtime_hours, base_pay, overtime_pay, adjustments_total, net_pay)
-     VALUES (@itemId, @siteId, @hoursWorked, @overtimeHours, @basePay, @overtimePay, @adjustmentsTotal, @netPay)`
-  );
-  const siteNameCache = {};
-  const siteName = (siteId) => {
-    if (!(siteId in siteNameCache)) {
-      const s = db.prepare('SELECT name FROM sites WHERE id = ?').get(siteId);
-      siteNameCache[siteId] = s ? s.name : `Site ${siteId}`;
-    }
-    return siteNameCache[siteId];
-  };
+    // Dates a site was marked "off" within (or overlapping) this period —
+    // that site+date is excluded from pay entirely, no matter what was
+    // logged.
+    const offDays = (await client.query(`SELECT site_id, date FROM site_off_days WHERE date BETWEEN $1 AND $2`, [period_start, period_end])).rows;
+    const offSet = new Set(offDays.map((o) => `${o.site_id}:${o.date}`));
 
-  // First pass: per-worker site slices (for their own pay + itemized cuts/
-  // bonuses), plus a running total per site (needed to prorate flat
-  // additional_payment amounts across everyone who worked there).
-  const workerData = [];
-  const siteTotals = {}; // site_id -> { hours, overtime } across every worker, period-wide
-  for (const w of workers) {
-    const records = db
-      .prepare(`SELECT * FROM attendance WHERE worker_id = ? AND date BETWEEN ? AND ?`)
-      .all(w.id, period_start, period_end)
-      .filter((r) => !offSet.has(`${r.site_id}:${r.date}`));
+    const workers = (await client.query(`SELECT * FROM workers WHERE status = 'active'`)).rows;
 
-    const presentDates = new Set();
-    let hoursWorked = 0;
-    let overtimeHours = 0;
-    let leaveHours = 0;
-    const bySite = {}; // site_id -> { hours, overtime }
-
-    for (const r of records) {
-      if (r.hours_worked > 0) presentDates.add(r.date);
-      hoursWorked += r.hours_worked || 0;
-      overtimeHours += r.overtime_hours || 0;
-      leaveHours += r.leave_hours || 0;
-      if (!bySite[r.site_id]) bySite[r.site_id] = { hours: 0, overtime: 0 };
-      bySite[r.site_id].hours += r.hours_worked || 0;
-      bySite[r.site_id].overtime += r.overtime_hours || 0;
-      if (!siteTotals[r.site_id]) siteTotals[r.site_id] = { hours: 0, overtime: 0 };
-      siteTotals[r.site_id].hours += r.hours_worked || 0;
-      siteTotals[r.site_id].overtime += r.overtime_hours || 0;
+    const siteNameCache = {};
+    async function siteName(siteId) {
+      if (!(siteId in siteNameCache)) {
+        const s = (await client.query('SELECT name FROM sites WHERE id = $1', [siteId])).rows[0];
+        siteNameCache[siteId] = s ? s.name : `Site ${siteId}`;
+      }
+      return siteNameCache[siteId];
     }
 
-    workerData.push({
-      w,
-      presentDates,
-      hoursWorked,
-      overtimeHours,
-      leaveHours,
-      bySite,
-      basePay: hoursWorked * w.wage_rate,
-      overtimePay: overtimeHours * w.wage_rate * (w.overtime_multiplier || 1.5),
-    });
-  }
+    // First pass: per-worker site slices (for their own pay + itemized cuts/
+    // bonuses), plus a running total per site (needed to prorate flat
+    // additional_payment amounts across everyone who worked there).
+    const workerData = [];
+    const siteTotals = {}; // site_id -> { hours, overtime } across every worker, period-wide
+    for (const w of workers) {
+      const records = (
+        await client.query(`SELECT * FROM attendance WHERE worker_id = $1 AND date BETWEEN $2 AND $3`, [w.id, period_start, period_end])
+      ).rows.filter((r) => !offSet.has(`${r.site_id}:${r.date}`));
 
-  for (const wd of workerData) {
-    const { w } = wd;
-    const itemInfo = insertItem.run({
-      runId,
-      workerId: w.id,
-      vendorId: w.vendor_id,
-      daysPresent: wd.presentDates.size,
-      leaveHours: wd.leaveHours,
-      hoursWorked: wd.hoursWorked,
-      overtimeHours: wd.overtimeHours,
-      basePay: wd.basePay,
-      overtimePay: wd.overtimePay,
-    });
-    const itemId = itemInfo.lastInsertRowid;
+      const presentDates = new Set();
+      let hoursWorked = 0;
+      let overtimeHours = 0;
+      let leaveHours = 0;
+      const bySite = {}; // site_id -> { hours, overtime }
 
-    // Apply any site performance adjustments, scoped to just what this worker
-    // earned/worked at that particular site during the overlapping window —
-    // a worker split across a cut site and a clean site is only affected on
-    // the cut site's share. Every site slice (even one with no adjustments)
-    // gets a payroll_item_sites row, so the run can be verified site by site
-    // afterward.
-    for (const [siteIdStr, slice] of Object.entries(wd.bySite)) {
-      const siteId = Number(siteIdStr);
-      const sliceBasePay = slice.hours * w.wage_rate;
-      const sliceOvertimePay = slice.overtime * w.wage_rate * (w.overtime_multiplier || 1.5);
-      const sliceTotal = sliceBasePay + sliceOvertimePay;
-      const siteHoursTotal = (siteTotals[siteId] && siteTotals[siteId].hours + siteTotals[siteId].overtime) || 0;
-      const workerHoursShare = slice.hours + slice.overtime;
-      const adjustments = sitePerformanceAdjustmentsFor(siteId, period_start, period_end);
-      let sliceAdjustmentTotal = 0;
-
-      for (const adj of adjustments) {
-        if (adj.adjustment_type === 'additional_payment') {
-          if (!siteHoursTotal || !adj.flat_amount) continue;
-          const amount = Math.round(adj.flat_amount * (workerHoursShare / siteHoursTotal) * -100) / 100; // negative = addition
-          if (amount === 0) continue;
-          insertDeduction.run(
-            itemId,
-            `${siteName(siteId)} additional payment (${adj.period_start} to ${adj.period_end})${adj.reason ? ': ' + adj.reason : ''}`,
-            amount
-          );
-          sliceAdjustmentTotal += amount;
-        } else {
-          if (!adj.cut_percent) continue;
-          const sign = adj.adjustment_type === 'bonus' ? -1 : 1;
-          const amount = Math.round(sliceTotal * (adj.cut_percent / 100) * sign * 100) / 100;
-          if (amount === 0) continue;
-          insertDeduction.run(
-            itemId,
-            `${siteName(siteId)} performance ${adj.adjustment_type} — ${adj.cut_percent}% (${adj.period_start} to ${adj.period_end})${
-              adj.reason ? ': ' + adj.reason : ''
-            }`,
-            amount
-          );
-          sliceAdjustmentTotal += amount;
-        }
+      for (const r of records) {
+        if (r.hours_worked > 0) presentDates.add(r.date);
+        hoursWorked += r.hours_worked || 0;
+        overtimeHours += r.overtime_hours || 0;
+        leaveHours += r.leave_hours || 0;
+        if (!bySite[r.site_id]) bySite[r.site_id] = { hours: 0, overtime: 0 };
+        bySite[r.site_id].hours += r.hours_worked || 0;
+        bySite[r.site_id].overtime += r.overtime_hours || 0;
+        if (!siteTotals[r.site_id]) siteTotals[r.site_id] = { hours: 0, overtime: 0 };
+        siteTotals[r.site_id].hours += r.hours_worked || 0;
+        siteTotals[r.site_id].overtime += r.overtime_hours || 0;
       }
 
-      insertItemSite.run({
-        itemId,
-        siteId,
-        hoursWorked: slice.hours,
-        overtimeHours: slice.overtime,
-        basePay: sliceBasePay,
-        overtimePay: sliceOvertimePay,
-        adjustmentsTotal: sliceAdjustmentTotal,
-        netPay: sliceTotal - sliceAdjustmentTotal,
+      workerData.push({
+        w,
+        presentDates,
+        hoursWorked,
+        overtimeHours,
+        leaveHours,
+        bySite,
+        basePay: hoursWorked * w.wage_rate,
+        overtimePay: overtimeHours * w.wage_rate * (w.overtime_multiplier || 1.5),
       });
     }
-  }
 
-  return runId;
+    for (const wd of workerData) {
+      const { w } = wd;
+      const itemResult = await client.query(
+        `INSERT INTO payroll_items (payroll_run_id, worker_id, vendor_id, days_present, leave_hours, hours_worked, overtime_hours, base_pay, overtime_pay)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [runId, w.id, w.vendor_id, wd.presentDates.size, wd.leaveHours, wd.hoursWorked, wd.overtimeHours, wd.basePay, wd.overtimePay]
+      );
+      const itemId = itemResult.rows[0].id;
+
+      // Apply any site performance adjustments, scoped to just what this
+      // worker earned/worked at that particular site during the overlapping
+      // window — a worker split across a cut site and a clean site is only
+      // affected on the cut site's share. Every site slice (even one with no
+      // adjustments) gets a payroll_item_sites row, so the run can be
+      // verified site by site afterward.
+      for (const [siteIdStr, slice] of Object.entries(wd.bySite)) {
+        const siteId = Number(siteIdStr);
+        const sliceBasePay = slice.hours * w.wage_rate;
+        const sliceOvertimePay = slice.overtime * w.wage_rate * (w.overtime_multiplier || 1.5);
+        const sliceTotal = sliceBasePay + sliceOvertimePay;
+        const siteHoursTotal = (siteTotals[siteId] && siteTotals[siteId].hours + siteTotals[siteId].overtime) || 0;
+        const workerHoursShare = slice.hours + slice.overtime;
+        const adjustments = await sitePerformanceAdjustmentsFor(siteId, period_start, period_end, client);
+        let sliceAdjustmentTotal = 0;
+
+        for (const adj of adjustments) {
+          if (adj.adjustment_type === 'additional_payment') {
+            if (!siteHoursTotal || !adj.flat_amount) continue;
+            const amount = Math.round(adj.flat_amount * (workerHoursShare / siteHoursTotal) * -100) / 100; // negative = addition
+            if (amount === 0) continue;
+            await client.query('INSERT INTO payroll_deductions (payroll_item_id, reason, amount, created_at) VALUES ($1, $2, $3, $4)', [
+              itemId,
+              `${await siteName(siteId)} additional payment (${adj.period_start} to ${adj.period_end})${adj.reason ? ': ' + adj.reason : ''}`,
+              amount,
+              nowSqliteStyle(),
+            ]);
+            sliceAdjustmentTotal += amount;
+          } else {
+            if (!adj.cut_percent) continue;
+            const sign = adj.adjustment_type === 'bonus' ? -1 : 1;
+            const amount = Math.round(sliceTotal * (adj.cut_percent / 100) * sign * 100) / 100;
+            if (amount === 0) continue;
+            await client.query('INSERT INTO payroll_deductions (payroll_item_id, reason, amount, created_at) VALUES ($1, $2, $3, $4)', [
+              itemId,
+              `${await siteName(siteId)} performance ${adj.adjustment_type} — ${adj.cut_percent}% (${adj.period_start} to ${adj.period_end})${
+                adj.reason ? ': ' + adj.reason : ''
+              }`,
+              amount,
+              nowSqliteStyle(),
+            ]);
+            sliceAdjustmentTotal += amount;
+          }
+        }
+
+        await client.query(
+          `INSERT INTO payroll_item_sites (payroll_item_id, site_id, hours_worked, overtime_hours, base_pay, overtime_pay, adjustments_total, net_pay)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [itemId, siteId, slice.hours, slice.overtime, sliceBasePay, sliceOvertimePay, sliceAdjustmentTotal, sliceTotal - sliceAdjustmentTotal]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    return runId;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // Per-site breakdown of a payroll run, built from the payroll_item_sites
@@ -2027,11 +2028,11 @@ function generatePayroll({ period_start, period_end, notes }, userId) {
 // been verified for this run. A run generated before this feature exists
 // has no payroll_item_sites rows at all — treated as "legacy" and falls
 // back to the old whole-run verify button.
-function sitesForPayrollRun(runId) {
-  const rows = db
-    .prepare(
+async function sitesForPayrollRun(runId) {
+  const rows = (
+    await pool.query(
       `SELECT pis.site_id, s.name site_name,
-        COUNT(DISTINCT pis.payroll_item_id) worker_count,
+        COUNT(DISTINCT pis.payroll_item_id)::int worker_count,
         SUM(pis.hours_worked) hours_worked,
         SUM(pis.overtime_hours) overtime_hours,
         SUM(pis.base_pay) base_pay,
@@ -2041,17 +2042,19 @@ function sitesForPayrollRun(runId) {
        FROM payroll_item_sites pis
        JOIN payroll_items pi ON pi.id = pis.payroll_item_id
        JOIN sites s ON s.id = pis.site_id
-       WHERE pi.payroll_run_id = @runId
+       WHERE pi.payroll_run_id = $1
        GROUP BY pis.site_id, s.name
-       ORDER BY s.name`
+       ORDER BY s.name`,
+      [runId]
     )
-    .all({ runId });
-  const verifications = db
-    .prepare(
+  ).rows;
+  const verifications = (
+    await pool.query(
       `SELECT prsv.*, u.name verified_by_name FROM payroll_run_site_verifications prsv
-       LEFT JOIN users u ON u.id = prsv.verified_by WHERE prsv.payroll_run_id = @runId`
+       LEFT JOIN users u ON u.id = prsv.verified_by WHERE prsv.payroll_run_id = $1`,
+      [runId]
     )
-    .all({ runId });
+  ).rows;
   const verMap = {};
   verifications.forEach((v) => {
     verMap[v.site_id] = v;
@@ -2059,24 +2062,25 @@ function sitesForPayrollRun(runId) {
   return rows.map((r) => Object.assign({}, r, { verification: verMap[r.site_id] || null }));
 }
 
-function payrollItemsWithNet(runId) {
-  const items = db
-    .prepare(
+async function payrollItemsWithNet(runId) {
+  const items = (
+    await pool.query(
       `SELECT pi.*, w.name worker_name, v.name vendor_name,
         (SELECT COALESCE(SUM(amount),0) FROM payroll_deductions WHERE payroll_item_id = pi.id) deductions_total
        FROM payroll_items pi
        JOIN workers w ON w.id = pi.worker_id
        LEFT JOIN vendors v ON v.id = pi.vendor_id
-       WHERE pi.payroll_run_id = ? ORDER BY v.name, w.name`
+       WHERE pi.payroll_run_id = $1 ORDER BY v.name, w.name`,
+      [runId]
     )
-    .all(runId);
+  ).rows;
   return items.map((i) => Object.assign({}, i, { net_pay: i.base_pay + i.overtime_pay - i.deductions_total }));
 }
 
-function renderPayrollDetail(runId, user) {
-  const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(runId);
+async function renderPayrollDetail(runId, user) {
+  const run = (await pool.query('SELECT * FROM payroll_runs WHERE id = $1', [runId])).rows[0];
   if (!run) return null;
-  const withNet = payrollItemsWithNet(runId);
+  const withNet = await payrollItemsWithNet(runId);
   const total = withNet.reduce((sum, i) => sum + i.net_pay, 0);
 
   const vendorTotals = {};
@@ -2085,12 +2089,12 @@ function renderPayrollDetail(runId, user) {
     vendorTotals[key] = (vendorTotals[key] || 0) + i.net_pay;
   });
 
-  const verifiedByName = run.verified_by ? (db.prepare('SELECT name FROM users WHERE id = ?').get(run.verified_by) || {}).name : null;
-  const completedByName = run.completed_by ? (db.prepare('SELECT name FROM users WHERE id = ?').get(run.completed_by) || {}).name : null;
-  const flaggedByName = run.flagged_by ? (db.prepare('SELECT name FROM users WHERE id = ?').get(run.flagged_by) || {}).name : null;
+  const verifiedByName = run.verified_by ? ((await pool.query('SELECT name FROM users WHERE id = $1', [run.verified_by])).rows[0] || {}).name : null;
+  const completedByName = run.completed_by ? ((await pool.query('SELECT name FROM users WHERE id = $1', [run.completed_by])).rows[0] || {}).name : null;
+  const flaggedByName = run.flagged_by ? ((await pool.query('SELECT name FROM users WHERE id = $1', [run.flagged_by])).rows[0] || {}).name : null;
   const canApprove = user && PAYROLL_APPROVE_ROLES.includes(user.role);
   const canGenerate = user && PAYROLL_GENERATE_ROLES.includes(user.role);
-  const sites = sitesForPayrollRun(runId);
+  const sites = await sitesForPayrollRun(runId);
   const hasSiteBreakdown = sites.length > 0;
   const allSitesVerified = hasSiteBreakdown && sites.every((s) => s.verification);
 
@@ -2197,18 +2201,16 @@ function renderPayrollDetail(runId, user) {
   `;
 }
 
-function renderPayrollItemDetail(itemId, viewer) {
-  const item = db
-    .prepare(
+async function renderPayrollItemDetail(itemId, viewer) {
+  const item = (await pool.query(
       `SELECT pi.*, w.name worker_name, v.name vendor_name, pr.id run_id, pr.period_start, pr.period_end
        FROM payroll_items pi JOIN workers w ON w.id = pi.worker_id
        LEFT JOIN vendors v ON v.id = pi.vendor_id
        JOIN payroll_runs pr ON pr.id = pi.payroll_run_id
-       WHERE pi.id = ?`
-    )
-    .get(itemId);
+       WHERE pi.id = $1`
+    , [itemId])).rows[0];
   if (!item) return null;
-  const deductions = db.prepare('SELECT * FROM payroll_deductions WHERE payroll_item_id = ? ORDER BY id').all(itemId);
+  const deductions = (await pool.query('SELECT * FROM payroll_deductions WHERE payroll_item_id = $1 ORDER BY id', [itemId])).rows;
   const deductionsTotal = deductions.reduce((s, d) => s + d.amount, 0);
   const net = item.base_pay + item.overtime_pay - deductionsTotal;
 
@@ -2251,10 +2253,8 @@ function renderPayrollItemDetail(itemId, viewer) {
 }
 
 // ---------- Sites ----------
-function renderSites() {
-  const sites = db
-    .prepare(`SELECT s.*, (SELECT COUNT(*) FROM workers w WHERE w.site_id = s.id) worker_count FROM sites s ORDER BY s.id`)
-    .all();
+async function renderSites() {
+  const sites = (await pool.query(`SELECT s.*, (SELECT COUNT(*) FROM workers w WHERE w.site_id = s.id) worker_count FROM sites s ORDER BY s.id`, [])).rows;
   return `
   <h1>Sites</h1>
   <p class="subtitle">Site numbers run 100–999. Site 100 is the built-in Unassigned Pool that new workers land in by default.</p>
@@ -2299,9 +2299,9 @@ function renderSites() {
   `;
 }
 
-function renderSiteForm(site) {
-  const deps = siteDependencyCounts(site.id);
-  const currentWorkers = db.prepare(`SELECT id, name, status FROM workers WHERE site_id = ? ORDER BY name`).all(site.id);
+async function renderSiteForm(site) {
+  const deps = await siteDependencyCounts(site.id);
+  const currentWorkers = (await pool.query(`SELECT id, name, status FROM workers WHERE site_id = $1 ORDER BY name`, [site.id])).rows;
   const activeWorkers = currentWorkers.filter((w) => w.status === 'active');
 
   return `
@@ -2351,7 +2351,7 @@ function renderSiteForm(site) {
     <h2 class="mt-0" style="margin-top:0">Move all workers to another site</h2>
     <form method="POST" action="/sites/${site.id}/reassign-workers">
       <label>Move all ${activeWorkers.length} active worker(s) to</label>
-      <select name="target_site_id" required><option value="">Select site…</option>${siteOptions(null, { excludeId: site.id })}</select>
+      <select name="target_site_id" required><option value="">Select site…</option>${await siteOptions(null, { excludeId: site.id })}</select>
       <button class="btn secondary" type="submit">Reassign all workers</button>
     </form>
   </div>`
@@ -2363,26 +2363,24 @@ function renderSiteForm(site) {
 const ADJUSTMENT_TYPE_LABEL = { cut: 'Wage cut', bonus: 'Bonus', additional_payment: 'Additional payment' };
 const ADJUSTMENT_TYPE_BADGE = { cut: 'inactive', bonus: 'active', additional_payment: 'half_day' };
 
-function renderSitePerformance(opts) {
+async function renderSitePerformance(opts) {
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
   // Six oversight roles can VIEW this page, but only Admin/Labor Manager can
   // log/edit/remove adjustments — everyone else gets a read-only ledger with
   // no form and no action buttons (nothing on screen the server would 403).
   const canManage = !!(opts && opts.user && can(opts.user, 'siteperf.manage'));
   const editingRow = opts && opts.editingId && canManage
-    ? db.prepare('SELECT sp.*, s.name site_name FROM site_performance sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = ?').get(opts.editingId)
+    ? (await pool.query('SELECT sp.*, s.name site_name FROM site_performance sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1', [opts.editingId])).rows[0]
     : null;
   const v0 = (opts && opts.values) || editingRow || {};
   const period = currentPayPeriod();
-  const adjustments = db
-    .prepare(
+  const adjustments = (await pool.query(
       `SELECT sp.*, s.name site_name, u.name created_by_name
        FROM site_performance sp
        JOIN sites s ON s.id = sp.site_id
        LEFT JOIN users u ON u.id = sp.created_by
        ORDER BY sp.period_start DESC, sp.id DESC`
-    )
-    .all();
+    , [])).rows;
 
   return `
   <h1>Site performance</h1>
@@ -2394,7 +2392,7 @@ function renderSitePerformance(opts) {
     <form method="POST" action="${editingRow ? `/site-performance/${editingRow.id}` : '/site-performance'}" id="site-perf-form">
       ${editingRow ? `<p class="hint" style="margin-top:0">Editing the adjustment logged for <b>${esc(v0.site_name || '')}</b>. <a href="/site-performance">Cancel edit →</a></p>` : ''}
       <div class="form-row">
-        <div><label>Site</label><select name="site_id" required><option value="">Select site…</option>${siteOptions(v0.site_id)}</select></div>
+        <div><label>Site</label><select name="site_id" required><option value="">Select site…</option>${await siteOptions(v0.site_id)}</select></div>
         <div><label>Type</label>
           <select name="adjustment_type" id="adj-type" onchange="document.getElementById('cut-percent-field').style.display = this.value==='additional_payment' ? 'none' : ''; document.getElementById('flat-amount-field').style.display = this.value==='additional_payment' ? '' : 'none';">
             ${Object.entries(ADJUSTMENT_TYPE_LABEL)
@@ -2470,22 +2468,20 @@ function roleSelectOptions(selected, actingUser) {
   }).join('');
 }
 
-function renderUsers(opts) {
+async function renderUsers(opts) {
   const errorHtml = opts && opts.error ? `<div class="flash flash-error">${esc(opts.error)}</div>` : '';
   const v0 = (opts && opts.values) || {};
   const page = (opts && opts.page) || 1;
   const actingUser = opts && opts.actingUser;
   const actorIsSuperAdmin = actingUser && actingUser.role === 'super_admin';
-  const totalCount = db.prepare('SELECT COUNT(*) c FROM users').get().c;
-  const users = db
-    .prepare(`SELECT u.*, s.name site_name FROM users u LEFT JOIN sites s ON s.id = u.site_id ORDER BY u.name LIMIT ? OFFSET ?`)
-    .all(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+  const totalCount = (await pool.query('SELECT COUNT(*) c FROM users', [])).rows[0].c;
+  const users = (await pool.query(`SELECT u.*, s.name site_name FROM users u LEFT JOIN sites s ON s.id = u.site_id ORDER BY u.name LIMIT $1 OFFSET $2`, [PAGE_SIZE, (page - 1) * PAGE_SIZE])).rows;
   // For PM/SEs the single site_id column is meaningless — their real scope
   // lives in user_site_assignments. Surface it right here in the Site column
   // (with a link to change it) so an admin can see at a glance that an
   // assignment took, without hunting through another tab.
   const multiSiteAssignments = {};
-  db.prepare('SELECT user_id, site_id FROM user_site_assignments ORDER BY site_id').all().forEach((r) => {
+  (await pool.query('SELECT user_id, site_id FROM user_site_assignments ORDER BY site_id', [])).rows.forEach((r) => {
     (multiSiteAssignments[r.user_id] = multiSiteAssignments[r.user_id] || []).push(r.site_id);
   });
   const siteCellFor = (u) => {
@@ -2652,15 +2648,13 @@ const AUDIT_ENTITY_LABEL = {
 // Admin-only trail of significant mutations across the app (see logAudit()).
 // Read-only, paginated — this can grow indefinitely so it's the one list in
 // the app that always paginates, no matter the row count.
-function renderAuditLog(query) {
+async function renderAuditLog(query) {
   const page = pageFromQuery(query);
-  const totalCount = db.prepare('SELECT COUNT(*) c FROM audit_log').get().c;
-  const rows = db
-    .prepare(
+  const totalCount = (await pool.query('SELECT COUNT(*) c FROM audit_log', [])).rows[0].c;
+  const rows = (await pool.query(
       `SELECT al.*, u.name user_name FROM audit_log al LEFT JOIN users u ON u.id = al.user_id
-       ORDER BY al.id DESC LIMIT ? OFFSET ?`
-    )
-    .all(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+       ORDER BY al.id DESC LIMIT $1 OFFSET $2`
+    , [PAGE_SIZE, (page - 1) * PAGE_SIZE])).rows;
   return `
   <h1>Audit log</h1>
   <p class="subtitle">Who did what, and when — covers worker/vendor/site/user changes, payroll actions, and site-performance/site-off entries.</p>
@@ -2684,13 +2678,11 @@ function renderAuditLog(query) {
 }
 
 // ---------- Site assignments (Project Managers / Site Engineers) ----------
-function renderSiteAssignments(opts) {
-  const people = db
-    .prepare(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer') ORDER BY role, name`)
-    .all();
-  const sites = db.prepare('SELECT * FROM sites ORDER BY id').all();
+async function renderSiteAssignments(opts) {
+  const people = (await pool.query(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer') ORDER BY role, name`, [])).rows;
+  const sites = (await pool.query('SELECT * FROM sites ORDER BY id', [])).rows;
   const assignedMap = {}; // user_id -> Set(site_id)
-  db.prepare('SELECT user_id, site_id FROM user_site_assignments').all().forEach((r) => {
+  (await pool.query('SELECT user_id, site_id FROM user_site_assignments', [])).rows.forEach((r) => {
     if (!assignedMap[r.user_id]) assignedMap[r.user_id] = new Set();
     assignedMap[r.user_id].add(r.site_id);
   });
@@ -2768,7 +2760,7 @@ async function handleRequest(req, res) {
   }
 
   const cookies = parseCookies(req);
-  const user = auth.getUserFromToken(cookies.session);
+  const user = await auth.getUserFromToken(cookies.session);
   const theme = cookies.theme === 'dark' ? 'dark' : 'light';
 
   // ---------- CSRF identity ----------
@@ -2824,7 +2816,7 @@ async function handleRequest(req, res) {
       return send(res, 400, layout({ title: 'Bad request', user, currentPath: pathname, body: `<div class="card"><h1>Bad request</h1><p class="muted">That request couldn't be read. Go back and try again.</p></div>` }));
     }
     if (!csrf.verifyCsrf(csrfIdentity, reqBody._csrf)) {
-      logAudit(user ? user.id : null, 'csrf_reject', 'request', null, `blocked POST ${pathname}`);
+      await logAudit(user ? user.id : null, 'csrf_reject', 'request', null, `blocked POST ${pathname}`);
       return send(
         res,
         403,
@@ -2890,7 +2882,7 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/login' && req.method === 'POST') {
-    const result = auth.login(reqBody.username || '', reqBody.password || '');
+    const result = await auth.login(reqBody.username || '', reqBody.password || '');
     if (result && result.locked) {
       return redirect(res, '/login?error=' + encodeURIComponent('Too many failed attempts for this account — try again in 15 minutes.'));
     }
@@ -2906,7 +2898,7 @@ async function handleRequest(req, res) {
   // logout control is a small same-styled <form>, not a plain link, so this
   // is reached by a normal submit, not a hand-typed URL.
   if (pathname === '/logout' && req.method === 'POST') {
-    auth.logout(cookies.session);
+    await auth.logout(cookies.session);
     return redirect(res, '/login', `session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${COOKIE_SECURE}`);
   }
 
@@ -2958,13 +2950,13 @@ async function handleRequest(req, res) {
       return send(res, 400, layout({ title: 'Change password', user, currentPath: pathname, body: renderChangePasswordForm({ error: 'New password must be different from the current one.' }) }));
     }
     const { hash, salt } = auth.hashPassword(next);
-    db.prepare('UPDATE users SET password_hash = ?, salt = ?, must_change_password = 0 WHERE id = ?').run(hash, salt, user.id);
-    logAudit(user.id, 'update', 'user', user.id, `${user.username} changed their own password (first-login requirement cleared)`);
+    (await pool.query('UPDATE users SET password_hash = $1, salt = $2, must_change_password = 0 WHERE id = $3', [hash, salt, user.id]));
+    await logAudit(user.id, 'update', 'user', user.id, `${user.username} changed their own password (first-login requirement cleared)`);
     return redirect(res, '/');
   }
 
   if (pathname === '/' && req.method === 'GET') {
-    return send(res, 200, layout({ title: 'Dashboard', user, currentPath: pathname, body: renderDashboard(user) }));
+    return send(res, 200, layout({ title: 'Dashboard', user, currentPath: pathname, body: await renderDashboard(user) }));
   }
 
   // v9.9: split out of the Dashboard (see renderDashboard) so the daily
@@ -2983,18 +2975,18 @@ async function handleRequest(req, res) {
         title: 'Analytics',
         user,
         currentPath: pathname,
-        body: `<h1>Analytics</h1><p class="subtitle">Company-wide trends and comparisons. For today's operational view, see the <a href="/">Dashboard</a>.</p>${renderAnalyticsSection()}`,
+        body: `<h1>Analytics</h1><p class="subtitle">Company-wide trends and comparisons. For today's operational view, see the <a href="/">Dashboard</a>.</p>${await renderAnalyticsSection()}`,
       })
     );
   }
 
   // ---- Workers ----
   if (pathname === '/workers' && req.method === 'GET') {
-    return send(res, 200, layout({ title: 'Workers', user, currentPath: pathname, body: renderWorkersList(user, query) }));
+    return send(res, 200, layout({ title: 'Workers', user, currentPath: pathname, body: await renderWorkersList(user, query) }));
   }
   if (pathname === '/workers/new' && req.method === 'GET') {
     if (!WORKER_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Add worker', user, currentPath: '/workers', body: renderWorkerForm(null) }));
+    return send(res, 200, layout({ title: 'Add worker', user, currentPath: '/workers', body: await renderWorkerForm(null) }));
   }
   if (pathname === '/workers' && req.method === 'POST') {
     if (!WORKER_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
@@ -3007,11 +2999,11 @@ async function handleRequest(req, res) {
           title: 'Add worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(null, { error: 'Aadhar number must be exactly 12 digits.', values: b }),
+          body: await renderWorkerForm(null, { error: 'Aadhar number must be exactly 12 digits.', values: b }),
         })
       );
     }
-    if (findWorkerByAadhar(b.aadhar_number)) {
+    if (await findWorkerByAadhar(b.aadhar_number)) {
       return send(
         res,
         400,
@@ -3019,7 +3011,7 @@ async function handleRequest(req, res) {
           title: 'Add worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(null, { error: 'A worker with this Aadhar number already exists. Cannot add a duplicate.', values: b }),
+          body: await renderWorkerForm(null, { error: 'A worker with this Aadhar number already exists. Cannot add a duplicate.', values: b }),
         })
       );
     }
@@ -3032,7 +3024,7 @@ async function handleRequest(req, res) {
           title: 'Add worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(null, { error: 'A contact phone number (at least 10 digits) is required.', values: b }),
+          body: await renderWorkerForm(null, { error: 'A contact phone number (at least 10 digits) is required.', values: b }),
         })
       );
     }
@@ -3045,41 +3037,43 @@ async function handleRequest(req, res) {
           title: 'Add worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(null, { error: 'Hourly wage rate must be a positive number.', values: b }),
+          body: await renderWorkerForm(null, { error: 'Hourly wage rate must be a positive number.', values: b }),
         })
       );
     }
-    const newWorkerInfo = db.prepare(
-      `INSERT INTO workers (worker_code, name, worker_type_id, vendor_id, aadhar_number, site_id, wage_rate, overtime_multiplier, contact, status, skill_grade, verification_status, joined_date)
-       VALUES (@worker_code, @name, @worker_type_id, @vendor_id, @aadhar_number, ${POOL_SITE_ID}, @wage_rate, @overtime_multiplier, @contact, 'active', @skill_grade, 'pending', @joined_date)`
-    ).run({
-      worker_code: nextWorkerCode(),
-      name: b.name,
-      worker_type_id: b.worker_type_id || null,
-      vendor_id: b.vendor_id,
-      aadhar_number: b.aadhar_number,
-      wage_rate: wageRate,
-      overtime_multiplier: parseFloat(b.overtime_multiplier) || 1.5,
-      contact: contactDigits,
-      skill_grade: b.skill_grade || 'skilled',
-      joined_date: b.joined_date || todayStr(),
-    });
-    logAudit(user.id, 'create', 'worker', newWorkerInfo.lastInsertRowid, b.name);
+    const newWorkerInfo = await pool.query(
+      `INSERT INTO workers (worker_code, name, worker_type_id, vendor_id, aadhar_number, site_id, wage_rate, overtime_multiplier, contact, status, skill_grade, verification_status, joined_date, created_at)
+       VALUES ($1, $2, $3, $4, $5, ${POOL_SITE_ID}, $6, $7, $8, 'active', $9, 'pending', $10, $11) RETURNING id`,
+      [
+        await nextWorkerCode(),
+        b.name,
+        b.worker_type_id || null,
+        b.vendor_id,
+        b.aadhar_number,
+        wageRate,
+        parseFloat(b.overtime_multiplier) || 1.5,
+        contactDigits,
+        b.skill_grade || 'skilled',
+        b.joined_date || todayStr(),
+        nowSqliteStyle(),
+      ]
+    );
+    await logAudit(user.id, 'create', 'worker', newWorkerInfo.rows[0].id, b.name);
     return redirect(res, '/workers');
   }
   const workerEditMatch = pathname.match(/^\/workers\/(\d+)\/edit$/);
   if (workerEditMatch && req.method === 'GET') {
     if (!WORKER_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const w = db.prepare('SELECT * FROM workers WHERE id = ?').get(workerEditMatch[1]);
+    const w = (await pool.query('SELECT * FROM workers WHERE id = $1', [workerEditMatch[1]])).rows[0];
     if (!w) return send(res, 404, 'Not found');
-    return send(res, 200, layout({ title: 'Edit worker', user, currentPath: '/workers', body: renderWorkerForm(w, { user }) }));
+    return send(res, 200, layout({ title: 'Edit worker', user, currentPath: '/workers', body: await renderWorkerForm(w, { user }) }));
   }
   const workerUpdateMatch = pathname.match(/^\/workers\/(\d+)$/);
   if (workerUpdateMatch && req.method === 'POST') {
     if (!WORKER_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
     const id = workerUpdateMatch[1];
     const b = reqBody;
-    const existingWorker = db.prepare('SELECT * FROM workers WHERE id = ?').get(id);
+    const existingWorker = (await pool.query('SELECT * FROM workers WHERE id = $1', [id])).rows[0];
     if (!existingWorker) return send(res, 404, 'Not found');
     if (!AADHAR_RE.test(b.aadhar_number || '')) {
       return send(
@@ -3089,11 +3083,11 @@ async function handleRequest(req, res) {
           title: 'Edit worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(Object.assign({}, existingWorker, { id }), { error: 'Aadhar number must be exactly 12 digits.', values: b, user }),
+          body: await renderWorkerForm(Object.assign({}, existingWorker, { id }), { error: 'Aadhar number must be exactly 12 digits.', values: b, user }),
         })
       );
     }
-    if (findWorkerByAadhar(b.aadhar_number, id)) {
+    if (await findWorkerByAadhar(b.aadhar_number, id)) {
       return send(
         res,
         400,
@@ -3101,7 +3095,7 @@ async function handleRequest(req, res) {
           title: 'Edit worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(Object.assign({}, existingWorker, { id }), {
+          body: await renderWorkerForm(Object.assign({}, existingWorker, { id }), {
             error: 'A worker with this Aadhar number already exists. Cannot save a duplicate.',
             values: b,
             user,
@@ -3118,7 +3112,7 @@ async function handleRequest(req, res) {
           title: 'Edit worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(Object.assign({}, existingWorker, { id }), {
+          body: await renderWorkerForm(Object.assign({}, existingWorker, { id }), {
             error: 'A contact phone number (at least 10 digits) is required.',
             values: b,
             user,
@@ -3135,7 +3129,7 @@ async function handleRequest(req, res) {
           title: 'Edit worker',
           user,
           currentPath: '/workers',
-          body: renderWorkerForm(Object.assign({}, existingWorker, { id }), {
+          body: await renderWorkerForm(Object.assign({}, existingWorker, { id }), {
             error: 'Hourly wage rate must be a positive number.',
             values: b,
             user,
@@ -3143,25 +3137,26 @@ async function handleRequest(req, res) {
         })
       );
     }
-    db.prepare(
-      `UPDATE workers SET name=@name, worker_type_id=@worker_type_id, vendor_id=@vendor_id, aadhar_number=@aadhar_number,
-        site_id=@site_id, wage_rate=@wage_rate, overtime_multiplier=@overtime_multiplier, contact=@contact, status=@status, skill_grade=@skill_grade, joined_date=@joined_date
-       WHERE id=@id`
-    ).run({
-      id,
-      name: b.name,
-      worker_type_id: b.worker_type_id || null,
-      vendor_id: b.vendor_id,
-      aadhar_number: b.aadhar_number,
-      site_id: b.site_id,
-      wage_rate: editWageRate,
-      overtime_multiplier: parseFloat(b.overtime_multiplier) || 1.5,
-      contact: editContactDigits,
-      status: b.status || 'active',
-      skill_grade: b.skill_grade || 'skilled',
-      joined_date: b.joined_date || todayStr(),
-    });
-    logAudit(user.id, 'update', 'worker', id, b.name);
+    await pool.query(
+      `UPDATE workers SET name=$1, worker_type_id=$2, vendor_id=$3, aadhar_number=$4,
+        site_id=$5, wage_rate=$6, overtime_multiplier=$7, contact=$8, status=$9, skill_grade=$10, joined_date=$11
+       WHERE id=$12`,
+      [
+        b.name,
+        b.worker_type_id || null,
+        b.vendor_id,
+        b.aadhar_number,
+        b.site_id,
+        editWageRate,
+        parseFloat(b.overtime_multiplier) || 1.5,
+        editContactDigits,
+        b.status || 'active',
+        b.skill_grade || 'skilled',
+        b.joined_date || todayStr(),
+        id,
+      ]
+    );
+    await logAudit(user.id, 'update', 'worker', id, b.name);
     return redirect(res, '/workers');
   }
   // Worker hard-delete was removed per Zen's request — workers are retired via the
@@ -3172,9 +3167,9 @@ async function handleRequest(req, res) {
   if (workerAbsorbMatch && req.method === 'POST') {
     if (!WORKER_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
     const id = workerAbsorbMatch[1];
-    const w = db.prepare('SELECT * FROM workers WHERE id = ?').get(id);
-    const dId = directVendorId();
-    if (w && dId) db.prepare('UPDATE workers SET vendor_id = ? WHERE id = ?').run(dId, id);
+    const w = (await pool.query('SELECT * FROM workers WHERE id = $1', [id])).rows[0];
+    const dId = await directVendorId();
+    if (w && dId) (await pool.query('UPDATE workers SET vendor_id = $1 WHERE id = $2', [dId, id]));
     return redirect(res, `/workers/${id}/edit`);
   }
   // Identity verification is an HR responsibility — the worker's Aadhar
@@ -3185,17 +3180,17 @@ async function handleRequest(req, res) {
   if (workerVerifyMatch && req.method === 'POST') {
     if (!WORKER_VERIFY_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
     const id = workerVerifyMatch[1];
-    const w = db.prepare('SELECT * FROM workers WHERE id = ?').get(id);
+    const w = (await pool.query('SELECT * FROM workers WHERE id = $1', [id])).rows[0];
     if (!w) return send(res, 404, 'Not found');
     const next = w.verification_status === 'verified' ? 'pending' : 'verified';
-    db.prepare('UPDATE workers SET verification_status = ? WHERE id = ?').run(next, id);
+    (await pool.query('UPDATE workers SET verification_status = $1 WHERE id = $2', [next, id]));
     return redirect(res, `/workers/${id}/edit`);
   }
 
   // ---- Vendors ----
   if (pathname === '/vendors' && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Vendors', user, currentPath: pathname, body: renderVendors({ page: pageFromQuery(query) }) }));
+    return send(res, 200, layout({ title: 'Vendors', user, currentPath: pathname, body: await renderVendors({ page: pageFromQuery(query) }) }));
   }
   if (pathname === '/vendors' && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
@@ -3204,43 +3199,47 @@ async function handleRequest(req, res) {
     const whatsappSame = !!b.whatsapp_same;
     const whatsappDigits = whatsappSame ? contactDigits : digitsOnly(b.whatsapp);
     if (!b.name || !b.name.trim()) {
-      return send(res, 400, layout({ title: 'Vendors', user, currentPath: '/vendors', body: renderVendors({ error: 'Vendor name is required.', values: b }) }));
+      return send(res, 400, layout({ title: 'Vendors', user, currentPath: '/vendors', body: await renderVendors({ error: 'Vendor name is required.', values: b }) }));
     }
     if (!PHONE_RE.test(contactDigits)) {
       return send(
         res,
         400,
-        layout({ title: 'Vendors', user, currentPath: '/vendors', body: renderVendors({ error: 'A vendor contact phone number (at least 10 digits) is required.', values: b }) })
+        layout({ title: 'Vendors', user, currentPath: '/vendors', body: await renderVendors({ error: 'A vendor contact phone number (at least 10 digits) is required.', values: b }) })
       );
     }
     if (!whatsappSame && b.whatsapp && !PHONE_RE.test(whatsappDigits)) {
       return send(
         res,
         400,
-        layout({ title: 'Vendors', user, currentPath: '/vendors', body: renderVendors({ error: 'WhatsApp number must be at least 10 digits.', values: b }) })
+        layout({ title: 'Vendors', user, currentPath: '/vendors', body: await renderVendors({ error: 'WhatsApp number must be at least 10 digits.', values: b }) })
       );
     }
     if (b.email && !EMAIL_RE.test(b.email.trim())) {
-      return send(res, 400, layout({ title: 'Vendors', user, currentPath: '/vendors', body: renderVendors({ error: 'That does not look like a valid email address.', values: b }) }));
+      return send(res, 400, layout({ title: 'Vendors', user, currentPath: '/vendors', body: await renderVendors({ error: 'That does not look like a valid email address.', values: b }) }));
     }
-    const newVendorInfo = db.prepare('INSERT INTO vendors (vendor_code, name, contact, whatsapp, email, address, is_direct) VALUES (?, ?, ?, ?, ?, ?, 0)').run(
-      nextVendorCode(),
-      b.name.trim(),
-      contactDigits,
-      whatsappSame || b.whatsapp ? whatsappDigits : null,
-      b.email ? b.email.trim() : null,
-      b.address ? b.address.trim() : null
+    const newVendorInfo = await pool.query(
+      'INSERT INTO vendors (vendor_code, name, contact, whatsapp, email, address, is_direct, created_at) VALUES ($1, $2, $3, $4, $5, $6, 0, $7) RETURNING id',
+      [
+        await nextVendorCode(),
+        b.name.trim(),
+        contactDigits,
+        whatsappSame || b.whatsapp ? whatsappDigits : null,
+        b.email ? b.email.trim() : null,
+        b.address ? b.address.trim() : null,
+        nowSqliteStyle(),
+      ]
     );
-    logAudit(user.id, 'create', 'vendor', newVendorInfo.lastInsertRowid, b.name.trim());
+    await logAudit(user.id, 'create', 'vendor', newVendorInfo.rows[0].id, b.name.trim());
     return redirect(res, '/vendors');
   }
   const vendorDeleteMatch = pathname.match(/^\/vendors\/(\d+)\/delete$/);
   if (vendorDeleteMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(vendorDeleteMatch[1]);
+    const v = (await pool.query('SELECT * FROM vendors WHERE id = $1', [vendorDeleteMatch[1]])).rows[0];
     if (!v) return send(res, 404, 'Not found');
     if (v.is_direct) return redirect(res, '/vendors');
-    const deps = vendorDependencyCounts(v.id);
+    const deps = await vendorDependencyCounts(v.id);
     if (deps.workers > 0 || deps.payrollItems > 0) {
       return send(
         res,
@@ -3253,22 +3252,22 @@ async function handleRequest(req, res) {
             type: 'error',
             message: `Can't delete ${v.name} — it has ${deps.workers} worker(s) and ${deps.payrollItems} payroll record(s) tied to it. Reassign or deactivate its workers from the vendor's Edit page first, then deactivate the vendor.`,
           },
-          body: renderVendors(),
+          body: await renderVendors(),
         })
       );
     }
-    db.prepare('DELETE FROM vendors WHERE id = ?').run(v.id);
-    logAudit(user.id, 'delete', 'vendor', v.id, v.name);
+    (await pool.query('DELETE FROM vendors WHERE id = $1', [v.id]));
+    await logAudit(user.id, 'delete', 'vendor', v.id, v.name);
     return redirect(res, '/vendors');
   }
   const vendorToggleActiveMatch = pathname.match(/^\/vendors\/(\d+)\/toggle-active$/);
   if (vendorToggleActiveMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(vendorToggleActiveMatch[1]);
+    const v = (await pool.query('SELECT * FROM vendors WHERE id = $1', [vendorToggleActiveMatch[1]])).rows[0];
     if (!v) return send(res, 404, 'Not found');
     if (v.is_direct) return redirect(res, '/vendors');
     if (v.active) {
-      const deps = vendorDependencyCounts(v.id);
+      const deps = await vendorDependencyCounts(v.id);
       if (deps.activeWorkers > 0) {
         return send(
           res,
@@ -3281,12 +3280,12 @@ async function handleRequest(req, res) {
               type: 'error',
               message: `Can't deactivate ${v.name} — it still has ${deps.activeWorkers} active worker(s). Reassign or mark them inactive below first.`,
             },
-            body: renderVendorForm(v),
+            body: await renderVendorForm(v),
           })
         );
       }
     }
-    db.prepare('UPDATE vendors SET active = ? WHERE id = ?').run(v.active ? 0 : 1, v.id);
+    (await pool.query('UPDATE vendors SET active = $1 WHERE id = $2', [v.active ? 0 : 1, v.id]));
     return redirect(res, '/vendors');
   }
   const vendorReassignMatch = pathname.match(/^\/vendors\/(\d+)\/reassign-workers$/);
@@ -3296,7 +3295,7 @@ async function handleRequest(req, res) {
     const b = reqBody;
     const targetId = b.target_vendor_id;
     if (targetId && String(targetId) !== String(sourceId)) {
-      db.prepare(`UPDATE workers SET vendor_id = ? WHERE vendor_id = ? AND status = 'active'`).run(targetId, sourceId);
+      (await pool.query(`UPDATE workers SET vendor_id = $1 WHERE vendor_id = $2 AND status = 'active'`, [targetId, sourceId]));
     }
     return redirect(res, `/vendors/${sourceId}/edit`);
   }
@@ -3304,25 +3303,25 @@ async function handleRequest(req, res) {
   if (vendorDeactivateWorkersMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
     const vendorId = vendorDeactivateWorkersMatch[1];
-    db.prepare(`UPDATE workers SET status = 'inactive' WHERE vendor_id = ? AND status = 'active'`).run(vendorId);
+    (await pool.query(`UPDATE workers SET status = 'inactive' WHERE vendor_id = $1 AND status = 'active'`, [vendorId]));
     return redirect(res, `/vendors/${vendorId}/edit`);
   }
   const vendorEditMatch = pathname.match(/^\/vendors\/(\d+)\/edit$/);
   if (vendorEditMatch && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(vendorEditMatch[1]);
+    const v = (await pool.query('SELECT * FROM vendors WHERE id = $1', [vendorEditMatch[1]])).rows[0];
     if (!v) return send(res, 404, 'Not found');
-    return send(res, 200, layout({ title: 'Edit vendor', user, currentPath: '/vendors', body: renderVendorForm(v) }));
+    return send(res, 200, layout({ title: 'Edit vendor', user, currentPath: '/vendors', body: await renderVendorForm(v) }));
   }
   const vendorUpdateMatch = pathname.match(/^\/vendors\/(\d+)$/);
   if (vendorUpdateMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
     const id = vendorUpdateMatch[1];
-    const existingVendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+    const existingVendor = (await pool.query('SELECT * FROM vendors WHERE id = $1', [id])).rows[0];
     if (!existingVendor) return send(res, 404, 'Not found');
     const b = reqBody;
     const codeToUse = existingVendor.is_direct ? existingVendor.vendor_code : b.vendor_code;
-    const dupe = db.prepare('SELECT * FROM vendors WHERE vendor_code = ? AND id != ?').get(codeToUse, id);
+    const dupe = (await pool.query('SELECT * FROM vendors WHERE vendor_code = $1 AND id != $2', [codeToUse, id])).rows[0];
     if (dupe) {
       return send(
         res,
@@ -3331,7 +3330,7 @@ async function handleRequest(req, res) {
           title: 'Edit vendor',
           user,
           currentPath: '/vendors',
-          body: renderVendorForm(Object.assign({}, existingVendor, { id }), {
+          body: await renderVendorForm(Object.assign({}, existingVendor, { id }), {
             error: 'A vendor with this code already exists.',
             values: b,
           }),
@@ -3349,7 +3348,7 @@ async function handleRequest(req, res) {
           title: 'Edit vendor',
           user,
           currentPath: '/vendors',
-          body: renderVendorForm(Object.assign({}, existingVendor, { id }), {
+          body: await renderVendorForm(Object.assign({}, existingVendor, { id }), {
             error: 'A vendor contact phone number (at least 10 digits) is required.',
             values: b,
           }),
@@ -3364,7 +3363,7 @@ async function handleRequest(req, res) {
           title: 'Edit vendor',
           user,
           currentPath: '/vendors',
-          body: renderVendorForm(Object.assign({}, existingVendor, { id }), { error: 'WhatsApp number must be at least 10 digits.', values: b }),
+          body: await renderVendorForm(Object.assign({}, existingVendor, { id }), { error: 'WhatsApp number must be at least 10 digits.', values: b }),
         })
       );
     }
@@ -3376,11 +3375,11 @@ async function handleRequest(req, res) {
           title: 'Edit vendor',
           user,
           currentPath: '/vendors',
-          body: renderVendorForm(Object.assign({}, existingVendor, { id }), { error: 'That does not look like a valid email address.', values: b }),
+          body: await renderVendorForm(Object.assign({}, existingVendor, { id }), { error: 'That does not look like a valid email address.', values: b }),
         })
       );
     }
-    db.prepare('UPDATE vendors SET vendor_code = ?, name = ?, contact = ?, whatsapp = ?, email = ?, address = ? WHERE id = ?').run(
+    (await pool.query('UPDATE vendors SET vendor_code = $1, name = $2, contact = $3, whatsapp = $4, email = $5, address = $6 WHERE id = $7', [
       codeToUse,
       b.name,
       vendorContactDigits,
@@ -3388,21 +3387,21 @@ async function handleRequest(req, res) {
       b.email ? b.email.trim() : null,
       b.address ? b.address.trim() : null,
       id
-    );
-    logAudit(user.id, 'update', 'vendor', id, b.name);
+    ]));
+    await logAudit(user.id, 'update', 'vendor', id, b.name);
     return redirect(res, '/vendors');
   }
 
   // ---- Worker types ----
   if (pathname === '/worker-types' && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Worker types', user, currentPath: pathname, body: renderWorkerTypes() }));
+    return send(res, 200, layout({ title: 'Worker types', user, currentPath: pathname, body: await renderWorkerTypes() }));
   }
   if (pathname === '/worker-types' && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
     const b = reqBody;
     try {
-      db.prepare('INSERT INTO worker_types (name) VALUES (?)').run(b.name);
+      (await pool.query('INSERT INTO worker_types (name) VALUES ($1)', [b.name]));
     } catch (e) {
       /* duplicate name — ignore for prototype */
     }
@@ -3411,8 +3410,8 @@ async function handleRequest(req, res) {
   const typeToggleMatch = pathname.match(/^\/worker-types\/(\d+)\/toggle$/);
   if (typeToggleMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const t = db.prepare('SELECT * FROM worker_types WHERE id = ?').get(typeToggleMatch[1]);
-    if (t) db.prepare('UPDATE worker_types SET active = ? WHERE id = ?').run(t.active ? 0 : 1, t.id);
+    const t = (await pool.query('SELECT * FROM worker_types WHERE id = $1', [typeToggleMatch[1]])).rows[0];
+    if (t) (await pool.query('UPDATE worker_types SET active = $1 WHERE id = $2', [t.active ? 0 : 1, t.id]));
     return redirect(res, '/worker-types');
   }
 
@@ -3421,17 +3420,17 @@ async function handleRequest(req, res) {
     if (!can(user, 'workers.skill_assess')) return forbidden(res, user, pathname, layout);
     const opts = {};
     if (query.saved) opts.saved = decodeURIComponent(query.saved);
-    return send(res, 200, layout({ title: 'Skill assessments', user, currentPath: pathname, body: renderSkillAssessments(user, query, opts) }));
+    return send(res, 200, layout({ title: 'Skill assessments', user, currentPath: pathname, body: await renderSkillAssessments(user, query, opts) }));
   }
   // Category management is its own page (v9.4) — see renderSkillCategories.
   if (pathname === '/skill-assessments/categories' && req.method === 'GET') {
     if (!can(user, 'skillcategories.manage')) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Manage skill categories', user, currentPath: '/skill-assessments', body: renderSkillCategories(user) }));
+    return send(res, 200, layout({ title: 'Manage skill categories', user, currentPath: '/skill-assessments', body: await renderSkillCategories(user) }));
   }
   if (pathname === '/skill-assessments/categories' && req.method === 'POST') {
     if (!can(user, 'skillcategories.manage')) return forbidden(res, user, pathname, layout);
     const b = reqBody;
-    const wt = db.prepare('SELECT * FROM worker_types WHERE id = ?').get(b.worker_type_id);
+    const wt = (await pool.query('SELECT * FROM worker_types WHERE id = $1', [b.worker_type_id])).rows[0];
     const name = (b.name || '').trim();
     if (!wt || !name) {
       return send(
@@ -3441,13 +3440,13 @@ async function handleRequest(req, res) {
           title: 'Manage skill categories',
           user,
           currentPath: '/skill-assessments',
-          body: renderSkillCategories(user, { error: !wt ? 'Select a valid worker type.' : 'Category name is required.', selectedType: b.worker_type_id }),
+          body: await renderSkillCategories(user, { error: !wt ? 'Select a valid worker type.' : 'Category name is required.', selectedType: b.worker_type_id }),
         })
       );
     }
     try {
-      db.prepare('INSERT INTO skill_categories (worker_type_id, name) VALUES (?, ?)').run(wt.id, name);
-      logAudit(user.id, 'create', 'skill_category', null, `${wt.name} — ${name}`);
+      (await pool.query('INSERT INTO skill_categories (worker_type_id, name, created_at) VALUES ($1, $2, $3)', [wt.id, name, nowSqliteStyle()]));
+      await logAudit(user.id, 'create', 'skill_category', null, `${wt.name} — ${name}`);
     } catch (e) {
       // UNIQUE(worker_type_id, name) — a duplicate category for this type.
       // Not worth a hard failure; just re-render with a note, matching the
@@ -3459,7 +3458,7 @@ async function handleRequest(req, res) {
           title: 'Manage skill categories',
           user,
           currentPath: '/skill-assessments',
-          body: renderSkillCategories(user, { error: `"${name}" already exists for ${wt.name}.`, selectedType: b.worker_type_id }),
+          body: await renderSkillCategories(user, { error: `"${name}" already exists for ${wt.name}.`, selectedType: b.worker_type_id }),
         })
       );
     }
@@ -3468,17 +3467,17 @@ async function handleRequest(req, res) {
   const skillCategoryToggleMatch = pathname.match(/^\/skill-assessments\/categories\/(\d+)\/toggle$/);
   if (skillCategoryToggleMatch && req.method === 'POST') {
     if (!can(user, 'skillcategories.manage')) return forbidden(res, user, pathname, layout);
-    const c = db.prepare('SELECT * FROM skill_categories WHERE id = ?').get(skillCategoryToggleMatch[1]);
+    const c = (await pool.query('SELECT * FROM skill_categories WHERE id = $1', [skillCategoryToggleMatch[1]])).rows[0];
     if (c) {
-      db.prepare('UPDATE skill_categories SET active = ? WHERE id = ?').run(c.active ? 0 : 1, c.id);
-      logAudit(user.id, c.active ? 'disable' : 'enable', 'skill_category', c.id, c.name);
+      (await pool.query('UPDATE skill_categories SET active = $1 WHERE id = $2', [c.active ? 0 : 1, c.id]));
+      await logAudit(user.id, c.active ? 'disable' : 'enable', 'skill_category', c.id, c.name);
     }
     return redirect(res, '/skill-assessments/categories');
   }
   const skillCategoryRenameMatch = pathname.match(/^\/skill-assessments\/categories\/(\d+)\/rename$/);
   if (skillCategoryRenameMatch && req.method === 'POST') {
     if (!can(user, 'skillcategories.manage')) return forbidden(res, user, pathname, layout);
-    const c = db.prepare('SELECT * FROM skill_categories WHERE id = ?').get(skillCategoryRenameMatch[1]);
+    const c = (await pool.query('SELECT * FROM skill_categories WHERE id = $1', [skillCategoryRenameMatch[1]])).rows[0];
     if (!c) return send(res, 404, 'Not found');
     const b = reqBody;
     const name = (b.name || '').trim();
@@ -3490,19 +3489,19 @@ async function handleRequest(req, res) {
           title: 'Manage skill categories',
           user,
           currentPath: '/skill-assessments',
-          body: renderSkillCategories(user, { error: 'Category name is required.' }),
+          body: await renderSkillCategories(user, { error: 'Category name is required.' }),
         })
       );
     }
     if (name !== c.name) {
       try {
-        db.prepare('UPDATE skill_categories SET name = ? WHERE id = ?').run(name, c.id);
-        logAudit(user.id, 'rename', 'skill_category', c.id, `"${c.name}" → "${name}"`);
+        (await pool.query('UPDATE skill_categories SET name = $1 WHERE id = $2', [name, c.id]));
+        await logAudit(user.id, 'rename', 'skill_category', c.id, `"${c.name}" → "${name}"`);
       } catch (e) {
         // UNIQUE(worker_type_id, name) — renaming into a name that already
         // exists for this worker type. Same friendly-error treatment as
         // creating a duplicate category.
-        const wt = db.prepare('SELECT * FROM worker_types WHERE id = ?').get(c.worker_type_id);
+        const wt = (await pool.query('SELECT * FROM worker_types WHERE id = $1', [c.worker_type_id])).rows[0];
         return send(
           res,
           400,
@@ -3510,7 +3509,7 @@ async function handleRequest(req, res) {
             title: 'Manage skill categories',
             user,
             currentPath: '/skill-assessments',
-            body: renderSkillCategories(user, { error: `"${name}" already exists for ${wt ? wt.name : 'this worker type'}.` }),
+            body: await renderSkillCategories(user, { error: `"${name}" already exists for ${wt ? wt.name : 'this worker type'}.` }),
           })
         );
       }
@@ -3520,18 +3519,13 @@ async function handleRequest(req, res) {
   if (pathname === '/skill-assessments/rate' && req.method === 'POST') {
     if (!can(user, 'workers.skill_assess')) return forbidden(res, user, pathname, layout);
     const b = reqBody;
-    const worker = db.prepare('SELECT * FROM workers WHERE id = ?').get(b.worker_id);
+    const worker = (await pool.query('SELECT * FROM workers WHERE id = $1', [b.worker_id])).rows[0];
     if (!worker) return send(res, 404, 'Not found');
     // Only categories that actually belong to this worker's type and are
     // currently active are honored — a stale form (type changed mid-edit,
     // or a category disabled after the page loaded) can't write a rating for
     // a category it shouldn't apply to.
-    const validCats = new Set(skillCategoriesForType(worker.worker_type_id).map((c) => c.id));
-    const upsert = db.prepare(
-      `INSERT INTO worker_skill_ratings (worker_id, skill_category_id, rating, rated_by) VALUES (@workerId, @catId, @rating, @ratedBy)
-       ON CONFLICT(worker_id, skill_category_id) DO UPDATE SET rating = @rating, rated_by = @ratedBy, rated_at = datetime('now')`
-    );
-    const clearRating = db.prepare('DELETE FROM worker_skill_ratings WHERE worker_id = ? AND skill_category_id = ?');
+    const validCats = new Set((await skillCategoriesForType(worker.worker_type_id)).map((c) => c.id));
     let ratedCount = 0;
     for (const key of Object.keys(b)) {
       const m = key.match(/^rating_(\d+)$/);
@@ -3540,14 +3534,18 @@ async function handleRequest(req, res) {
       if (!validCats.has(catId)) continue;
       const rating = b[key];
       if (!rating) {
-        clearRating.run(worker.id, catId);
+        await pool.query('DELETE FROM worker_skill_ratings WHERE worker_id = $1 AND skill_category_id = $2', [worker.id, catId]);
         continue;
       }
       if (!['trainee', 'skilled', 'expert'].includes(rating)) continue;
-      upsert.run({ workerId: worker.id, catId, rating, ratedBy: user.id });
+      await pool.query(
+        `INSERT INTO worker_skill_ratings (worker_id, skill_category_id, rating, rated_by, rated_at) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (worker_id, skill_category_id) DO UPDATE SET rating = $3, rated_by = $4, rated_at = $5`,
+        [worker.id, catId, rating, user.id, nowSqliteStyle()]
+      );
       ratedCount++;
     }
-    logAudit(user.id, 'update', 'worker_skill_ratings', worker.id, `${worker.name} — ${ratedCount} categor${ratedCount === 1 ? 'y' : 'ies'} rated`);
+    await logAudit(user.id, 'update', 'worker_skill_ratings', worker.id, `${worker.name} — ${ratedCount} categor${ratedCount === 1 ? 'y' : 'ies'} rated`);
     const returnQuery = b.return_query || '';
     return redirect(res, `/skill-assessments?worker_id=${worker.id}&saved=${encodeURIComponent(worker.name)}${returnQuery ? '&' + returnQuery : ''}`);
   }
@@ -3555,7 +3553,7 @@ async function handleRequest(req, res) {
   // ---- Attendance ----
   if (pathname === '/attendance' && req.method === 'GET') {
     if (!ATTENDANCE_MARK_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Attendance', user, currentPath: pathname, body: renderAttendance(user, query) }));
+    return send(res, 200, layout({ title: 'Attendance', user, currentPath: pathname, body: await renderAttendance(user, query) }));
   }
   if (pathname === '/attendance' && req.method === 'POST') {
     if (!ATTENDANCE_MARK_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
@@ -3573,7 +3571,7 @@ async function handleRequest(req, res) {
     // the same helper the single-entry route uses — the grid only renders this
     // site's crew, but a hand-crafted POST can name any id, and without this
     // an injected hours_<id> would be written unchecked.
-    const bulkReject = (message) =>
+    const bulkReject = async (message) =>
       send(
         res,
         400,
@@ -3582,17 +3580,17 @@ async function handleRequest(req, res) {
           user,
           currentPath: '/attendance',
           flash: { type: 'error', message },
-          body: renderAttendance(user, { date, site_id: siteId }),
+          body: await renderAttendance(user, { date, site_id: siteId }),
         })
       );
     if (!isValidDateStr(date)) return bulkReject(`${ATTENDANCE_BAD_DATE} Nothing was saved.`);
-    const bulkSiteError = attendanceSiteError(user, siteId);
+    const bulkSiteError = await attendanceSiteError(user, siteId);
     if (bulkSiteError) return bulkReject(`${bulkSiteError} Nothing was saved.`);
     for (const key of Object.keys(b)) {
       const m = key.match(/^hours_(\d+)$/);
       if (!m) continue;
       const workerId = m[1];
-      const workerError = attendanceWorkerError(workerId);
+      const workerError = await attendanceWorkerError(workerId);
       if (workerError) return bulkReject(`${workerError} Nothing was saved.`);
       const hours = parseFloat(b[`hours_${workerId}`]) || 0;
       const ot = parseFloat(b[`ot_${workerId}`]) || 0;
@@ -3602,25 +3600,26 @@ async function handleRequest(req, res) {
         );
       }
     }
-    const upsert = db.prepare(
-      `INSERT INTO attendance (worker_id, site_id, date, hours_worked, leave_hours, overtime_hours, marked_by)
-       VALUES (@workerId, @siteId, @date, @hours, @leave, @ot, @markedBy)
-       ON CONFLICT(worker_id, date, site_id) DO UPDATE SET hours_worked=@hours, leave_hours=@leave, overtime_hours=@ot, marked_by=@markedBy, marked_at=datetime('now')`
-    );
     for (const key of Object.keys(b)) {
       const m = key.match(/^hours_(\d+)$/);
       if (!m) continue;
       const workerId = m[1];
-      upsert.run({
-        workerId,
-        siteId,
-        date,
-        hours: parseFloat(b[`hours_${workerId}`]) || 0,
-        leave: parseFloat(b[`leave_${workerId}`]) || 0,
-        ot: parseFloat(b[`ot_${workerId}`]) || 0,
-        markedBy: user.id,
-      });
-      auditCrossSiteAttendance(user, workerId, siteId, date);
+      await pool.query(
+        `INSERT INTO attendance (worker_id, site_id, date, hours_worked, leave_hours, overtime_hours, marked_by, marked_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (worker_id, date, site_id) DO UPDATE SET hours_worked=$4, leave_hours=$5, overtime_hours=$6, marked_by=$7, marked_at=$8`,
+        [
+          workerId,
+          siteId,
+          date,
+          parseFloat(b[`hours_${workerId}`]) || 0,
+          parseFloat(b[`leave_${workerId}`]) || 0,
+          parseFloat(b[`ot_${workerId}`]) || 0,
+          user.id,
+          nowSqliteStyle(),
+        ]
+      );
+      await auditCrossSiteAttendance(user, workerId, siteId, date);
     }
     return redirect(res, `/attendance?date=${encodeURIComponent(date)}&site_id=${encodeURIComponent(siteId)}`);
   }
@@ -3629,7 +3628,7 @@ async function handleRequest(req, res) {
     return send(
       res,
       200,
-      layout({ title: 'Add single attendance entry', user, currentPath: '/attendance', body: renderSingleEntry(user, query) })
+      layout({ title: 'Add single attendance entry', user, currentPath: '/attendance', body: await renderSingleEntry(user, query) })
     );
   }
   if (pathname === '/attendance/entry' && req.method === 'POST') {
@@ -3644,7 +3643,7 @@ async function handleRequest(req, res) {
     // Worker/site/date eligibility, same helper the bulk grid uses. Runs
     // before the hours check so a request that names an ineligible worker or
     // site is rejected whatever its hours say.
-    const entryError = attendanceWriteError(user, b);
+    const entryError = await attendanceWriteError(user, b);
     if (entryError || hours + ot > 10) {
       return send(
         res,
@@ -3660,28 +3659,21 @@ async function handleRequest(req, res) {
           // Re-render the single-entry page (where this form now lives) with
           // what was typed still in the fields, so a rejected submission
           // doesn't make the user re-pick the worker, site, and date.
-          body: renderSingleEntry(user, { date: b.date }, { values: b }),
+          body: await renderSingleEntry(user, { date: b.date }, { values: b }),
         })
       );
     }
-    db.prepare(
-      `INSERT INTO attendance (worker_id, site_id, date, hours_worked, leave_hours, overtime_hours, marked_by)
-       VALUES (@workerId, @siteId, @date, @hours, @leave, @ot, @markedBy)
-       ON CONFLICT(worker_id, date, site_id) DO UPDATE SET hours_worked=@hours, leave_hours=@leave, overtime_hours=@ot, marked_by=@markedBy, marked_at=datetime('now')`
-    ).run({
-      workerId: b.worker_id,
-      siteId: b.site_id,
-      date: b.date,
-      hours,
-      leave: parseFloat(b.leave) || 0,
-      ot,
-      markedBy: user.id,
-    });
-    auditCrossSiteAttendance(user, b.worker_id, b.site_id, b.date);
+    await pool.query(
+      `INSERT INTO attendance (worker_id, site_id, date, hours_worked, leave_hours, overtime_hours, marked_by, marked_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (worker_id, date, site_id) DO UPDATE SET hours_worked=$4, leave_hours=$5, overtime_hours=$6, marked_by=$7, marked_at=$8`,
+      [b.worker_id, b.site_id, b.date, hours, parseFloat(b.leave) || 0, ot, user.id, nowSqliteStyle()]
+    );
+    await auditCrossSiteAttendance(user, b.worker_id, b.site_id, b.date);
     // Back to the single-entry page with a confirmation rather than the bulk
     // grid — corrections usually come in twos and threes, and the page carries
     // a "Back to site attendance" button for when they're done.
-    const savedWorker = db.prepare('SELECT name FROM workers WHERE id = ?').get(b.worker_id);
+    const savedWorker = (await pool.query('SELECT name FROM workers WHERE id = $1', [b.worker_id])).rows[0];
     return redirect(
       res,
       `/attendance/single-entry?date=${encodeURIComponent(b.date || todayStr())}&saved=${encodeURIComponent(
@@ -3691,7 +3683,7 @@ async function handleRequest(req, res) {
   }
   if (pathname === '/attendance/site-off' && req.method === 'GET') {
     if (!ATTENDANCE_MARK_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Site off days', user, currentPath: '/attendance', body: renderSiteOff(user, query) }));
+    return send(res, 200, layout({ title: 'Site off days', user, currentPath: '/attendance', body: await renderSiteOff(user, query) }));
   }
   if (pathname === '/attendance/site-off' && req.method === 'POST') {
     if (!ATTENDANCE_MARK_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
@@ -3700,24 +3692,24 @@ async function handleRequest(req, res) {
     // only mark their own site off, never one submitted in the form.
     if (user.role === 'supervisor') b.site_id = user.site_id;
     if (b.site_id && b.date) {
-      db.prepare(
-        `INSERT INTO site_off_days (site_id, date, reason, created_by) VALUES (?, ?, ?, ?)
-         ON CONFLICT(site_id, date) DO UPDATE SET reason = excluded.reason`
-      ).run(b.site_id, b.date, b.reason || null, user.id);
-      logAudit(user.id, 'create', 'site_off_day', null, `site ${b.site_id} — ${b.date}`);
+      (await pool.query(
+        `INSERT INTO site_off_days (site_id, date, reason, created_by, created_at) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (site_id, date) DO UPDATE SET reason = EXCLUDED.reason`
+      , [b.site_id, b.date, b.reason || null, user.id, nowSqliteStyle()]));
+      await logAudit(user.id, 'create', 'site_off_day', null, `site ${b.site_id} — ${b.date}`);
     }
     return redirect(res, `/attendance/site-off?date=${encodeURIComponent(b.date || todayStr())}&site_id=${encodeURIComponent(b.site_id || '')}`);
   }
   const siteOffDeleteMatch = pathname.match(/^\/attendance\/site-off\/(\d+)\/delete$/);
   if (siteOffDeleteMatch && req.method === 'POST') {
     if (!ATTENDANCE_MARK_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const off = db.prepare('SELECT * FROM site_off_days WHERE id = ?').get(siteOffDeleteMatch[1]);
+    const off = (await pool.query('SELECT * FROM site_off_days WHERE id = $1', [siteOffDeleteMatch[1]])).rows[0];
     // A supervisor can only remove an off-day for their own site — without
     // this, the same IDOR as the writes above would let them delete another
     // site's off-day by guessing/incrementing the id in the POST url.
     if (user.role === 'supervisor' && off && String(off.site_id) !== String(user.site_id)) return forbidden(res, user, pathname, layout);
-    db.prepare('DELETE FROM site_off_days WHERE id = ?').run(siteOffDeleteMatch[1]);
-    logAudit(user.id, 'delete', 'site_off_day', siteOffDeleteMatch[1], off ? `site ${off.site_id} — ${off.date}` : null);
+    (await pool.query('DELETE FROM site_off_days WHERE id = $1', [siteOffDeleteMatch[1]]));
+    await logAudit(user.id, 'delete', 'site_off_day', siteOffDeleteMatch[1], off ? `site ${off.site_id} — ${off.date}` : null);
     return redirect(res, `/attendance/site-off${off ? `?site_id=${off.site_id}&date=${off.date}` : ''}`);
   }
   const attendanceDeleteMatch = pathname.match(/^\/attendance\/(\d+)\/delete$/);
@@ -3726,16 +3718,16 @@ async function handleRequest(req, res) {
     // per Zen) — oversight roles (PM/SE/CEO/etc.) and supervisors view
     // history but never delete from it.
     if (!can(user, 'attendance.delete')) return forbidden(res, user, pathname, layout);
-    const entry = db.prepare('SELECT * FROM attendance WHERE id = ?').get(attendanceDeleteMatch[1]);
-    db.prepare('DELETE FROM attendance WHERE id = ?').run(attendanceDeleteMatch[1]);
-    logAudit(user.id, 'delete', 'attendance', attendanceDeleteMatch[1], entry ? `worker ${entry.worker_id} — ${entry.date} @ site ${entry.site_id}` : null);
+    const entry = (await pool.query('SELECT * FROM attendance WHERE id = $1', [attendanceDeleteMatch[1]])).rows[0];
+    (await pool.query('DELETE FROM attendance WHERE id = $1', [attendanceDeleteMatch[1]]));
+    await logAudit(user.id, 'delete', 'attendance', attendanceDeleteMatch[1], entry ? `worker ${entry.worker_id} — ${entry.date} @ site ${entry.site_id}` : null);
     return redirect(res, '/attendance/history');
   }
   if (pathname === '/attendance/history' && req.method === 'GET') {
-    return send(res, 200, layout({ title: 'Attendance history', user, currentPath: '/attendance', body: renderAttendanceHistory(user, query) }));
+    return send(res, 200, layout({ title: 'Attendance history', user, currentPath: '/attendance', body: await renderAttendanceHistory(user, query) }));
   }
   if (pathname === '/attendance/history/export.csv' && req.method === 'GET') {
-    const { rows } = attendanceHistoryRows(user, query);
+    const { rows } = await attendanceHistoryRows(user, query);
     const csvOut = [
       ['Date', 'Worker', 'Site', 'Hours worked', 'Overtime hours', 'Leave hours'],
       ...rows.map((r) => [r.date, r.worker_name, r.site_name || '', r.hours_worked, r.overtime_hours, r.leave_hours]),
@@ -3746,7 +3738,7 @@ async function handleRequest(req, res) {
   // ---- Payroll ----
   if (pathname === '/payroll' && req.method === 'GET') {
     if (!OVERSIGHT_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Payroll', user, currentPath: pathname, body: renderPayrollList(user, query) }));
+    return send(res, 200, layout({ title: 'Payroll', user, currentPath: pathname, body: await renderPayrollList(user, query) }));
   }
   if (pathname === '/payroll/new' && req.method === 'GET') {
     if (!PAYROLL_GENERATE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
@@ -3770,9 +3762,7 @@ async function handleRequest(req, res) {
     }
     b.period_start = snapped.start;
     b.period_end = snapped.end;
-    const existing = db
-      .prepare(`SELECT * FROM payroll_runs WHERE period_start = ? AND period_end = ? AND flagged = 0 ORDER BY id DESC LIMIT 1`)
-      .get(b.period_start, b.period_end);
+    const existing = (await pool.query(`SELECT * FROM payroll_runs WHERE period_start = $1 AND period_end = $2 AND flagged = 0 ORDER BY id DESC LIMIT 1`, [b.period_start, b.period_end])).rows[0];
     if (existing) {
       return send(
         res,
@@ -3792,7 +3782,7 @@ async function handleRequest(req, res) {
     }
     let runId;
     try {
-      runId = generatePayroll(b, user.id);
+      runId = await generatePayroll(b, user.id);
     } catch (e) {
       // Backstop for the idx_payroll_runs_period_unflagged constraint (db.js)
       // — the SELECT check above already covers the normal case, this only
@@ -3812,26 +3802,29 @@ async function handleRequest(req, res) {
         })
       );
     }
-    logAudit(user.id, 'generate', 'payroll_run', runId, `${b.period_start} → ${b.period_end}`);
+    await logAudit(user.id, 'generate', 'payroll_run', runId, `${b.period_start} → ${b.period_end}`);
     return redirect(res, `/payroll/${runId}`);
   }
   const payrollFlagMatch = pathname.match(/^\/payroll\/(\d+)\/flag$/);
   if (payrollFlagMatch && req.method === 'POST') {
     if (!PAYROLL_GENERATE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
     const b = reqBody;
-    const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(payrollFlagMatch[1]);
+    const run = (await pool.query('SELECT * FROM payroll_runs WHERE id = $1', [payrollFlagMatch[1]])).rows[0];
     if (run && !run.flagged) {
-      db.prepare(
-        `UPDATE payroll_runs SET flagged = 1, flagged_by = ?, flagged_at = datetime('now'), flagged_reason = ? WHERE id = ?`
-      ).run(user.id, (b.reason || '').trim() || null, run.id);
-      logAudit(user.id, 'flag', 'payroll_run', run.id, b.reason || null);
+      (await pool.query(`UPDATE payroll_runs SET flagged = 1, flagged_by = $1, flagged_at = $2, flagged_reason = $3 WHERE id = $4`, [
+        user.id,
+        nowSqliteStyle(),
+        (b.reason || '').trim() || null,
+        run.id,
+      ]));
+      await logAudit(user.id, 'flag', 'payroll_run', run.id, b.reason || null);
     }
     return redirect(res, `/payroll/${payrollFlagMatch[1]}`);
   }
   const payrollItemMatch = pathname.match(/^\/payroll\/items\/(\d+)$/);
   if (payrollItemMatch && req.method === 'GET') {
     if (!OVERSIGHT_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const html = renderPayrollItemDetail(payrollItemMatch[1], user);
+    const html = await renderPayrollItemDetail(payrollItemMatch[1], user);
     if (!html) return send(res, 404, 'Not found');
     return send(res, 200, layout({ title: 'Payroll item', user, currentPath: '/payroll', body: html }));
   }
@@ -3841,7 +3834,7 @@ async function handleRequest(req, res) {
     const b = reqBody;
     const amount = parseFloat(b.amount);
     if (!(amount > 0)) {
-      const html = renderPayrollItemDetail(deductionMatch[1], user);
+      const html = await renderPayrollItemDetail(deductionMatch[1], user);
       return send(
         res,
         400,
@@ -3854,26 +3847,27 @@ async function handleRequest(req, res) {
         })
       );
     }
-    db.prepare('INSERT INTO payroll_deductions (payroll_item_id, reason, amount) VALUES (?, ?, ?)').run(
+    (await pool.query('INSERT INTO payroll_deductions (payroll_item_id, reason, amount, created_at) VALUES ($1, $2, $3, $4)', [
       deductionMatch[1],
       b.reason,
-      amount
-    );
+      amount,
+      nowSqliteStyle(),
+    ]));
     return redirect(res, `/payroll/items/${deductionMatch[1]}`);
   }
   const payrollDetailMatch = pathname.match(/^\/payroll\/(\d+)$/);
   if (payrollDetailMatch && req.method === 'GET') {
     if (!OVERSIGHT_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const html = renderPayrollDetail(payrollDetailMatch[1], user);
+    const html = await renderPayrollDetail(payrollDetailMatch[1], user);
     if (!html) return send(res, 404, 'Not found');
     return send(res, 200, layout({ title: 'Payroll run', user, currentPath: '/payroll', body: html }));
   }
   const payrollCsvMatch = pathname.match(/^\/payroll\/(\d+)\/export\.csv$/);
   if (payrollCsvMatch && req.method === 'GET') {
     if (!OVERSIGHT_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(payrollCsvMatch[1]);
+    const run = (await pool.query('SELECT * FROM payroll_runs WHERE id = $1', [payrollCsvMatch[1]])).rows[0];
     if (!run) return send(res, 404, 'Not found');
-    const items = payrollItemsWithNet(payrollCsvMatch[1]);
+    const items = await payrollItemsWithNet(payrollCsvMatch[1]);
     const rows = [
       ['Worker', 'Vendor', 'Days present', 'Hours worked', 'Overtime hours', 'Leave hours', 'Base pay', 'Overtime pay', 'Deductions', 'Net pay'],
       ...items.map((i) => [
@@ -3894,20 +3888,18 @@ async function handleRequest(req, res) {
   const payrollVerifyMatch = pathname.match(/^\/payroll\/(\d+)\/verify$/);
   if (payrollVerifyMatch && req.method === 'POST') {
     if (!PAYROLL_APPROVE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(payrollVerifyMatch[1]);
+    const run = (await pool.query('SELECT * FROM payroll_runs WHERE id = $1', [payrollVerifyMatch[1]])).rows[0];
     // Legacy fallback only — runs generated after the site-verification
     // feature always have payroll_item_sites rows and must be verified site
     // by site via /payroll/:id/sites/:siteId/verify instead.
     const hasSiteBreakdown = run
-      ? db
-          .prepare(
-            `SELECT COUNT(*) c FROM payroll_item_sites pis JOIN payroll_items pi ON pi.id = pis.payroll_item_id WHERE pi.payroll_run_id = ?`
-          )
-          .get(run.id).c > 0
+      ? (await pool.query(
+            `SELECT COUNT(*) c FROM payroll_item_sites pis JOIN payroll_items pi ON pi.id = pis.payroll_item_id WHERE pi.payroll_run_id = $1`
+          , [run.id])).rows[0].c > 0
       : false;
     if (run && run.status === 'pending_verification' && !hasSiteBreakdown) {
-      db.prepare(`UPDATE payroll_runs SET status = 'verified', verified_by = ?, verified_at = datetime('now') WHERE id = ?`).run(user.id, run.id);
-      logAudit(user.id, 'verify', 'payroll_run', run.id, null);
+      (await pool.query(`UPDATE payroll_runs SET status = 'verified', verified_by = $1, verified_at = $3 WHERE id = $2`, [user.id, run.id, nowSqliteStyle()]));
+      await logAudit(user.id, 'verify', 'payroll_run', run.id, null);
     }
     return redirect(res, `/payroll/${payrollVerifyMatch[1]}`);
   }
@@ -3916,22 +3908,20 @@ async function handleRequest(req, res) {
     if (!PAYROLL_APPROVE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
     const runId = payrollSiteVerifyMatch[1];
     const siteId = payrollSiteVerifyMatch[2];
-    const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(runId);
+    const run = (await pool.query('SELECT * FROM payroll_runs WHERE id = $1', [runId])).rows[0];
     if (run && run.status === 'pending_verification') {
-      db.prepare(
-        `INSERT INTO payroll_run_site_verifications (payroll_run_id, site_id, verified_by) VALUES (?, ?, ?)
-         ON CONFLICT(payroll_run_id, site_id) DO NOTHING`
-      ).run(runId, siteId, user.id);
-      logAudit(user.id, 'verify_site', 'payroll_run', runId, `site ${siteId}`);
-      const totalSites = db
-        .prepare(
-          `SELECT COUNT(DISTINCT pis.site_id) c FROM payroll_item_sites pis JOIN payroll_items pi ON pi.id = pis.payroll_item_id WHERE pi.payroll_run_id = ?`
-        )
-        .get(runId).c;
-      const verifiedSites = db.prepare('SELECT COUNT(*) c FROM payroll_run_site_verifications WHERE payroll_run_id = ?').get(runId).c;
+      (await pool.query(
+        `INSERT INTO payroll_run_site_verifications (payroll_run_id, site_id, verified_by, verified_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (payroll_run_id, site_id) DO NOTHING`
+      , [runId, siteId, user.id, nowSqliteStyle()]));
+      await logAudit(user.id, 'verify_site', 'payroll_run', runId, `site ${siteId}`);
+      const totalSites = (await pool.query(
+          `SELECT COUNT(DISTINCT pis.site_id) c FROM payroll_item_sites pis JOIN payroll_items pi ON pi.id = pis.payroll_item_id WHERE pi.payroll_run_id = $1`
+        , [runId])).rows[0].c;
+      const verifiedSites = (await pool.query('SELECT COUNT(*) c FROM payroll_run_site_verifications WHERE payroll_run_id = $1', [runId])).rows[0].c;
       if (totalSites > 0 && verifiedSites >= totalSites) {
-        db.prepare(`UPDATE payroll_runs SET status = 'verified', verified_by = ?, verified_at = datetime('now') WHERE id = ?`).run(user.id, runId);
-        logAudit(user.id, 'verify', 'payroll_run', runId, 'all sites verified');
+        (await pool.query(`UPDATE payroll_runs SET status = 'verified', verified_by = $1, verified_at = $3 WHERE id = $2`, [user.id, runId, nowSqliteStyle()]));
+        await logAudit(user.id, 'verify', 'payroll_run', runId, 'all sites verified');
       }
     }
     return redirect(res, `/payroll/${runId}`);
@@ -3939,10 +3929,10 @@ async function handleRequest(req, res) {
   const payrollCompleteMatch = pathname.match(/^\/payroll\/(\d+)\/complete$/);
   if (payrollCompleteMatch && req.method === 'POST') {
     if (!PAYROLL_APPROVE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(payrollCompleteMatch[1]);
+    const run = (await pool.query('SELECT * FROM payroll_runs WHERE id = $1', [payrollCompleteMatch[1]])).rows[0];
     if (run && run.status === 'verified') {
-      db.prepare(`UPDATE payroll_runs SET status = 'completed', completed_by = ?, completed_at = datetime('now') WHERE id = ?`).run(user.id, run.id);
-      logAudit(user.id, 'complete', 'payroll_run', run.id, null);
+      (await pool.query(`UPDATE payroll_runs SET status = 'completed', completed_by = $1, completed_at = $3 WHERE id = $2`, [user.id, run.id, nowSqliteStyle()]));
+      await logAudit(user.id, 'complete', 'payroll_run', run.id, null);
     }
     return redirect(res, `/payroll/${payrollCompleteMatch[1]}`);
   }
@@ -3950,37 +3940,33 @@ async function handleRequest(req, res) {
   // ---- Sites ----
   if (pathname === '/sites' && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Sites', user, currentPath: pathname, body: renderSites() }));
+    return send(res, 200, layout({ title: 'Sites', user, currentPath: pathname, body: await renderSites() }));
   }
   if (pathname === '/sites' && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
     const b = reqBody;
-    const newSiteInfo = db.prepare('INSERT INTO sites (name, location, address, district, state, maps_link) VALUES (?, ?, ?, ?, ?, ?)').run(
-      b.name,
-      b.location || null,
-      b.address || null,
-      b.district || null,
-      b.state || null,
-      b.maps_link || null
+    const newSiteInfo = await pool.query(
+      'INSERT INTO sites (name, location, address, district, state, maps_link) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [b.name, b.location || null, b.address || null, b.district || null, b.state || null, b.maps_link || null]
     );
-    logAudit(user.id, 'create', 'site', newSiteInfo.lastInsertRowid, b.name);
+    await logAudit(user.id, 'create', 'site', newSiteInfo.rows[0].id, b.name);
     return redirect(res, '/sites');
   }
   const siteEditMatch = pathname.match(/^\/sites\/(\d+)\/edit$/);
   if (siteEditMatch && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const s = db.prepare('SELECT * FROM sites WHERE id = ?').get(siteEditMatch[1]);
+    const s = (await pool.query('SELECT * FROM sites WHERE id = $1', [siteEditMatch[1]])).rows[0];
     if (!s) return send(res, 404, 'Not found');
-    return send(res, 200, layout({ title: 'Edit site', user, currentPath: '/sites', body: renderSiteForm(s) }));
+    return send(res, 200, layout({ title: 'Edit site', user, currentPath: '/sites', body: await renderSiteForm(s) }));
   }
   const siteUpdateMatch = pathname.match(/^\/sites\/(\d+)$/);
   if (siteUpdateMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const s = db.prepare('SELECT * FROM sites WHERE id = ?').get(siteUpdateMatch[1]);
+    const s = (await pool.query('SELECT * FROM sites WHERE id = $1', [siteUpdateMatch[1]])).rows[0];
     if (!s) return send(res, 404, 'Not found');
     const b = reqBody;
     const status = ['active', 'on_hold', 'completed'].includes(b.status) ? b.status : 'active';
-    db.prepare('UPDATE sites SET name = ?, location = ?, status = ?, address = ?, district = ?, state = ?, maps_link = ? WHERE id = ?').run(
+    (await pool.query('UPDATE sites SET name = $1, location = $2, status = $3, address = $4, district = $5, state = $6, maps_link = $7 WHERE id = $8', [
       b.name,
       b.location || null,
       status,
@@ -3989,8 +3975,8 @@ async function handleRequest(req, res) {
       b.state || null,
       b.maps_link || null,
       siteUpdateMatch[1]
-    );
-    logAudit(user.id, 'update', 'site', siteUpdateMatch[1], b.name);
+    ]));
+    await logAudit(user.id, 'update', 'site', siteUpdateMatch[1], b.name);
     return redirect(res, '/sites');
   }
   // Site hard-delete was removed per Zen's request (v9, same policy as
@@ -4012,7 +3998,7 @@ async function handleRequest(req, res) {
     const b = reqBody;
     const targetId = b.target_site_id;
     if (targetId && String(targetId) !== String(sourceId)) {
-      db.prepare(`UPDATE workers SET site_id = ? WHERE site_id = ? AND status = 'active'`).run(targetId, sourceId);
+      (await pool.query(`UPDATE workers SET site_id = $1 WHERE site_id = $2 AND status = 'active'`, [targetId, sourceId]));
     }
     return redirect(res, `/sites/${sourceId}/edit`);
   }
@@ -4020,12 +4006,12 @@ async function handleRequest(req, res) {
   // ---- Site performance (cuts / bonuses / additional payments) ----
   if (pathname === '/site-performance' && req.method === 'GET') {
     if (!OVERSIGHT_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Site performance', user, currentPath: pathname, body: renderSitePerformance({ editingId: query.edit, user }) }));
+    return send(res, 200, layout({ title: 'Site performance', user, currentPath: pathname, body: await renderSitePerformance({ editingId: query.edit, user }) }));
   }
   if (pathname === '/site-performance' && req.method === 'POST') {
     if (!SITE_ADJUSTMENT_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
     const b = reqBody;
-    const site = db.prepare('SELECT * FROM sites WHERE id = ?').get(b.site_id);
+    const site = (await pool.query('SELECT * FROM sites WHERE id = $1', [b.site_id])).rows[0];
     const adjustmentType = ['cut', 'bonus', 'additional_payment'].includes(b.adjustment_type) ? b.adjustment_type : 'cut';
     const cutPercent = Number(b.cut_percent);
     const flatAmount = Number(b.flat_amount);
@@ -4040,7 +4026,7 @@ async function handleRequest(req, res) {
           title: 'Site performance',
           user,
           currentPath: '/site-performance',
-          body: renderSitePerformance({
+          body: await renderSitePerformance({
             error: !site
               ? 'Select a valid site.'
               : !validPercent
@@ -4056,35 +4042,37 @@ async function handleRequest(req, res) {
     }
     b.period_start = snapped.start;
     b.period_end = snapped.end;
-    const newAdjInfo = db.prepare(
-      `INSERT INTO site_performance (site_id, period_start, period_end, adjustment_type, cut_percent, flat_amount, reason, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      site.id,
-      b.period_start,
-      b.period_end,
-      adjustmentType,
-      adjustmentType === 'additional_payment' ? null : cutPercent,
-      adjustmentType === 'additional_payment' ? flatAmount : null,
-      b.reason || null,
-      user.id
+    const newAdjInfo = await pool.query(
+      `INSERT INTO site_performance (site_id, period_start, period_end, adjustment_type, cut_percent, flat_amount, reason, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [
+        site.id,
+        b.period_start,
+        b.period_end,
+        adjustmentType,
+        adjustmentType === 'additional_payment' ? null : cutPercent,
+        adjustmentType === 'additional_payment' ? flatAmount : null,
+        b.reason || null,
+        user.id,
+        nowSqliteStyle(),
+      ]
     );
-    logAudit(user.id, 'create', 'site_performance', newAdjInfo.lastInsertRowid, `${site.name} — ${adjustmentType}`);
+    await logAudit(user.id, 'create', 'site_performance', newAdjInfo.rows[0].id, `${site.name} — ${adjustmentType}`);
     return redirect(res, '/site-performance');
   }
   const sitePerfDeleteMatch = pathname.match(/^\/site-performance\/(\d+)\/delete$/);
   if (sitePerfDeleteMatch && req.method === 'POST') {
     if (!SITE_ADJUSTMENT_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    db.prepare('DELETE FROM site_performance WHERE id = ?').run(sitePerfDeleteMatch[1]);
-    logAudit(user.id, 'delete', 'site_performance', sitePerfDeleteMatch[1], null);
+    (await pool.query('DELETE FROM site_performance WHERE id = $1', [sitePerfDeleteMatch[1]]));
+    await logAudit(user.id, 'delete', 'site_performance', sitePerfDeleteMatch[1], null);
     return redirect(res, '/site-performance');
   }
   const sitePerfEditMatch = pathname.match(/^\/site-performance\/(\d+)$/);
   if (sitePerfEditMatch && req.method === 'POST') {
     if (!SITE_ADJUSTMENT_MANAGE_ROLES.includes(user.role)) return forbidden(res, user, pathname, layout);
-    const existing = db.prepare('SELECT * FROM site_performance WHERE id = ?').get(sitePerfEditMatch[1]);
+    const existing = (await pool.query('SELECT * FROM site_performance WHERE id = $1', [sitePerfEditMatch[1]])).rows[0];
     if (!existing) return send(res, 404, 'Not found');
     const b = reqBody;
-    const site = db.prepare('SELECT * FROM sites WHERE id = ?').get(b.site_id);
+    const site = (await pool.query('SELECT * FROM sites WHERE id = $1', [b.site_id])).rows[0];
     const adjustmentType = ['cut', 'bonus', 'additional_payment'].includes(b.adjustment_type) ? b.adjustment_type : 'cut';
     const cutPercent = Number(b.cut_percent);
     const flatAmount = Number(b.flat_amount);
@@ -4099,7 +4087,7 @@ async function handleRequest(req, res) {
           title: 'Site performance',
           user,
           currentPath: '/site-performance',
-          body: renderSitePerformance({
+          body: await renderSitePerformance({
             error: !site
               ? 'Select a valid site.'
               : !validPercent
@@ -4116,9 +4104,9 @@ async function handleRequest(req, res) {
     }
     b.period_start = snapped.start;
     b.period_end = snapped.end;
-    db.prepare(
-      `UPDATE site_performance SET site_id = ?, period_start = ?, period_end = ?, adjustment_type = ?, cut_percent = ?, flat_amount = ?, reason = ? WHERE id = ?`
-    ).run(
+    (await pool.query(
+      `UPDATE site_performance SET site_id = $1, period_start = $2, period_end = $3, adjustment_type = $4, cut_percent = $5, flat_amount = $6, reason = $7 WHERE id = $8`
+    , [
       site.id,
       b.period_start,
       b.period_end,
@@ -4127,33 +4115,33 @@ async function handleRequest(req, res) {
       adjustmentType === 'additional_payment' ? flatAmount : null,
       b.reason || null,
       existing.id
-    );
-    logAudit(user.id, 'update', 'site_performance', existing.id, `${site.name} — ${adjustmentType}`);
+    ]));
+    await logAudit(user.id, 'update', 'site_performance', existing.id, `${site.name} — ${adjustmentType}`);
     return redirect(res, '/site-performance');
   }
 
   // ---- Users ----
   if (pathname === '/users' && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Users', user, currentPath: pathname, body: renderUsers({ actingUser: user, page: pageFromQuery(query) }) }));
+    return send(res, 200, layout({ title: 'Users', user, currentPath: pathname, body: await renderUsers({ actingUser: user, page: pageFromQuery(query) }) }));
   }
   if (pathname === '/users' && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
     const b = reqBody;
     const contactDigits = digitsOnly(b.contact);
     if (!EMAIL_RE.test((b.username || '').trim())) {
-      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: renderUsers({ actingUser: user, error: 'Username must be a valid email address.', values: b }) }));
+      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: await renderUsers({ actingUser: user, error: 'Username must be a valid email address.', values: b }) }));
     }
     if (!PHONE_RE.test(contactDigits)) {
-      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: renderUsers({ actingUser: user, error: 'A phone number (at least 10 digits) is required.', values: b }) }));
+      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: await renderUsers({ actingUser: user, error: 'A phone number (at least 10 digits) is required.', values: b }) }));
     }
     if (!ALL_ROLES.includes(b.role)) {
-      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: renderUsers({ actingUser: user, error: 'Select a valid role.', values: b }) }));
+      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: await renderUsers({ actingUser: user, error: 'Select a valid role.', values: b }) }));
     }
     const saGuard = superAdminGuardError(user, { submittedRole: b.role });
-    if (saGuard) return send(res, 403, layout({ title: 'Users', user, currentPath: '/users', body: renderUsers({ actingUser: user, error: saGuard, values: b }) }));
+    if (saGuard) return send(res, 403, layout({ title: 'Users', user, currentPath: '/users', body: await renderUsers({ actingUser: user, error: saGuard, values: b }) }));
     if (!b.password || b.password.length < 8) {
-      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: renderUsers({ actingUser: user, error: 'Password must be at least 8 characters.', values: b }) }));
+      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: await renderUsers({ actingUser: user, error: 'Password must be at least 8 characters.', values: b }) }));
     }
     try {
       // v10: none of the seven approved roles carry a single site_id
@@ -4161,7 +4149,7 @@ async function handleRequest(req, res) {
       // user_site_assignments via the Site assignments page instead), so
       // this always creates with site_id null now — kept as a real column
       // rather than dropped, since historical supervisor rows still use it.
-      const newUserId = auth.createUser({
+      const newUserId = await auth.createUser({
         username: b.username.trim(),
         password: b.password,
         name: b.name,
@@ -4170,16 +4158,16 @@ async function handleRequest(req, res) {
         contact: contactDigits,
         mustChangePassword: !!b.must_change_password,
       });
-      logAudit(user.id, 'create', 'user', newUserId, `${b.username.trim()} (role: ${b.role})`);
+      await logAudit(user.id, 'create', 'user', newUserId, `${b.username.trim()} (role: ${b.role})`);
     } catch (e) {
-      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: renderUsers({ actingUser: user, error: 'A user with this username already exists.', values: b }) }));
+      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', body: await renderUsers({ actingUser: user, error: 'A user with this username already exists.', values: b }) }));
     }
     return redirect(res, '/users');
   }
   const userEditMatch = pathname.match(/^\/users\/(\d+)\/edit$/);
   if (userEditMatch && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userEditMatch[1]);
+    const target = (await pool.query('SELECT * FROM users WHERE id = $1', [userEditMatch[1]])).rows[0];
     if (!target) return send(res, 404, 'Not found');
     const saGuard = superAdminGuardError(user, { targetRole: target.role });
     if (saGuard) return forbidden(res, user, pathname, layout);
@@ -4188,7 +4176,7 @@ async function handleRequest(req, res) {
   const userUpdateMatch = pathname.match(/^\/users\/(\d+)$/);
   if (userUpdateMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userUpdateMatch[1]);
+    const target = (await pool.query('SELECT * FROM users WHERE id = $1', [userUpdateMatch[1]])).rows[0];
     if (!target) return send(res, 404, 'Not found');
     const b = reqBody;
     // Checked before any field validation below on purpose — an admin actor
@@ -4207,11 +4195,11 @@ async function handleRequest(req, res) {
     if (!ALL_ROLES.includes(b.role)) {
       return send(res, 400, layout({ title: 'Edit user', user, currentPath: '/users', body: renderUserForm(target, { actingUser: user, error: 'Select a valid role.', values: b }) }));
     }
-    const dupe = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(b.username.trim(), target.id);
+    const dupe = (await pool.query('SELECT id FROM users WHERE username = $1 AND id != $2', [b.username.trim(), target.id])).rows[0];
     if (dupe) {
       return send(res, 400, layout({ title: 'Edit user', user, currentPath: '/users', body: renderUserForm(target, { actingUser: user, error: 'A user with this username already exists.', values: b }) }));
     }
-    db.prepare('UPDATE users SET name = ?, username = ?, contact = ?, role = ?, site_id = ?, must_change_password = ? WHERE id = ?').run(
+    (await pool.query('UPDATE users SET name = $1, username = $2, contact = $3, role = $4, site_id = $5, must_change_password = $6 WHERE id = $7', [
       b.name,
       b.username.trim(),
       contactDigits,
@@ -4219,25 +4207,25 @@ async function handleRequest(req, res) {
       null, // v10: no approved role carries a single site_id anymore — see the create route above
       b.must_change_password ? 1 : 0,
       target.id
-    );
+    ]));
     if (b.password && b.password.trim()) {
       if (b.password.trim().length < 8) {
         return send(res, 400, layout({ title: 'Edit user', user, currentPath: '/users', body: renderUserForm(target, { actingUser: user, error: 'Password must be at least 8 characters.', values: b }) }));
       }
       const { hash, salt } = auth.hashPassword(b.password.trim());
-      db.prepare('UPDATE users SET password_hash = ?, salt = ? WHERE id = ?').run(hash, salt, target.id);
+      (await pool.query('UPDATE users SET password_hash = $1, salt = $2 WHERE id = $3', [hash, salt, target.id]));
     }
-    logAudit(user.id, 'update', 'user', target.id, `${b.username.trim()} (role: ${b.role})`);
+    await logAudit(user.id, 'update', 'user', target.id, `${b.username.trim()} (role: ${b.role})`);
     return redirect(res, '/users');
   }
   const userToggleMatch = pathname.match(/^\/users\/(\d+)\/toggle$/);
   if (userToggleMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userToggleMatch[1]);
+    const target = (await pool.query('SELECT * FROM users WHERE id = $1', [userToggleMatch[1]])).rows[0];
     if (target) {
       const saGuard = superAdminGuardError(user, { targetRole: target.role });
       if (saGuard) {
-        return send(res, 403, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: saGuard }, body: renderUsers({ actingUser: user }) }));
+        return send(res, 403, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: saGuard }, body: await renderUsers({ actingUser: user }) }));
       }
       const disabling = !!target.active;
       // v10 fix: this route only ever flips `active` — it never touches
@@ -4262,7 +4250,7 @@ async function handleRequest(req, res) {
               type: 'error',
               message: `${target.username}'s role ("${ROLE_LABEL[target.role] || target.role}") was removed in v10 and can no longer be re-enabled directly. Change their role to one of the seven current roles via Edit first, then re-enable.`,
             },
-            body: renderUsers({ actingUser: user }),
+            body: await renderUsers({ actingUser: user }),
           })
         );
       }
@@ -4275,14 +4263,12 @@ async function handleRequest(req, res) {
             user,
             currentPath: '/users',
             flash: { type: 'error', message: "You can't disable your own account." },
-            body: renderUsers({ actingUser: user }),
+            body: await renderUsers({ actingUser: user }),
           })
         );
       }
       if (disabling && target.role === 'admin') {
-        const otherActiveAdmins = db
-          .prepare(`SELECT COUNT(*) c FROM users WHERE role = 'admin' AND active = 1 AND id != ?`)
-          .get(target.id).c;
+        const otherActiveAdmins = (await pool.query(`SELECT COUNT(*) c FROM users WHERE role = 'admin' AND active = 1 AND id != $1`, [target.id])).rows[0].c;
         if (otherActiveAdmins === 0) {
           return send(
             res,
@@ -4292,7 +4278,7 @@ async function handleRequest(req, res) {
               user,
               currentPath: '/users',
               flash: { type: 'error', message: 'This is the last active admin account — disabling it would lock everyone out. Make another user an active admin first.' },
-              body: renderUsers({ actingUser: user }),
+              body: await renderUsers({ actingUser: user }),
             })
           );
         }
@@ -4301,9 +4287,7 @@ async function handleRequest(req, res) {
       // count above, since Super Admin's protection is about there always
       // being at least one active super_admin, not about admin at all.
       if (disabling && target.role === 'super_admin') {
-        const otherActiveSuperAdmins = db
-          .prepare(`SELECT COUNT(*) c FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?`)
-          .get(target.id).c;
+        const otherActiveSuperAdmins = (await pool.query(`SELECT COUNT(*) c FROM users WHERE role = 'super_admin' AND active = 1 AND id != $1`, [target.id])).rows[0].c;
         if (otherActiveSuperAdmins === 0) {
           return send(
             res,
@@ -4313,13 +4297,13 @@ async function handleRequest(req, res) {
               user,
               currentPath: '/users',
               flash: { type: 'error', message: 'This is the last active Super Admin account — disabling it would leave nobody able to manage Super Admin accounts. Promote another user to Super Admin first.' },
-              body: renderUsers({ actingUser: user }),
+              body: await renderUsers({ actingUser: user }),
             })
           );
         }
       }
-      db.prepare('UPDATE users SET active = ? WHERE id = ?').run(target.active ? 0 : 1, target.id);
-      logAudit(user.id, target.active ? 'disable_user' : 'enable_user', 'user', target.id, `${target.username} (role: ${target.role})`);
+      (await pool.query('UPDATE users SET active = $1 WHERE id = $2', [target.active ? 0 : 1, target.id]));
+      await logAudit(user.id, target.active ? 'disable_user' : 'enable_user', 'user', target.id, `${target.username} (role: ${target.role})`);
     }
     return redirect(res, '/users');
   }
@@ -4343,51 +4327,63 @@ async function handleRequest(req, res) {
   const userDeleteMatch = pathname.match(/^\/users\/(\d+)\/delete$/);
   if (userDeleteMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(userDeleteMatch[1]);
+    const target = (await pool.query('SELECT * FROM users WHERE id = $1', [userDeleteMatch[1]])).rows[0];
     if (!target) return redirect(res, '/users');
     const saGuard = superAdminGuardError(user, { targetRole: target.role });
     if (saGuard) {
-      return send(res, 403, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: saGuard }, body: renderUsers({ actingUser: user }) }));
+      return send(res, 403, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: saGuard }, body: await renderUsers({ actingUser: user }) }));
     }
     if (target.id === user.id) {
-      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: "You can't delete your own account." }, body: renderUsers({ actingUser: user }) }));
+      return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: "You can't delete your own account." }, body: await renderUsers({ actingUser: user }) }));
     }
     if (target.active && target.role === 'admin') {
-      const otherActiveAdmins = db.prepare(`SELECT COUNT(*) c FROM users WHERE role = 'admin' AND active = 1 AND id != ?`).get(target.id).c;
+      const otherActiveAdmins = (await pool.query(`SELECT COUNT(*) c FROM users WHERE role = 'admin' AND active = 1 AND id != $1`, [target.id])).rows[0].c;
       if (otherActiveAdmins === 0) {
-        return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: 'This is the last active admin account — deleting it would lock everyone out. Make another user an active admin first.' }, body: renderUsers({ actingUser: user }) }));
+        return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: 'This is the last active admin account — deleting it would lock everyone out. Make another user an active admin first.' }, body: await renderUsers({ actingUser: user }) }));
       }
     }
     if (target.active && target.role === 'super_admin') {
-      const otherActiveSuperAdmins = db.prepare(`SELECT COUNT(*) c FROM users WHERE role = 'super_admin' AND active = 1 AND id != ?`).get(target.id).c;
+      const otherActiveSuperAdmins = (await pool.query(`SELECT COUNT(*) c FROM users WHERE role = 'super_admin' AND active = 1 AND id != $1`, [target.id])).rows[0].c;
       if (otherActiveSuperAdmins === 0) {
-        return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: 'This is the last active Super Admin account — deleting it would leave nobody able to manage Super Admin accounts. Promote another user to Super Admin first.' }, body: renderUsers({ actingUser: user }) }));
+        return send(res, 400, layout({ title: 'Users', user, currentPath: '/users', flash: { type: 'error', message: 'This is the last active Super Admin account — deleting it would leave nobody able to manage Super Admin accounts. Promote another user to Super Admin first.' }, body: await renderUsers({ actingUser: user }) }));
       }
     }
     let deleted = false;
     let fkBlocked = false;
-    db.exec('BEGIN TRANSACTION;');
+    // All statements in this transaction must run on the SAME client, not the
+    // shared pool — pool.query() may hand out a different connection per
+    // call, which would silently break transactional atomicity.
+    const deleteClient = await pool.connect();
     try {
+      await deleteClient.query('BEGIN');
       // Backed up into the audit trail itself (id/username/role/active/
       // created_at) BEFORE the delete — this row only persists if the
       // whole transaction (including the DELETE below) actually commits,
       // so a blocked delete leaves no dangling "deleted" record behind.
-      logAudit(
-        user.id,
-        'delete',
-        'user',
-        target.id,
-        `${target.username} (role: ${target.role}, was ${target.active ? 'active' : 'disabled'}, created ${target.created_at}) — permanently deleted`
+      await deleteClient.query(
+        'INSERT INTO audit_log (user_id, action, entity_type, entity_id, details, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [
+          user.id,
+          'delete',
+          'user',
+          target.id,
+          `${target.username} (role: ${target.role}, was ${target.active ? 'active' : 'disabled'}, created ${target.created_at}) — permanently deleted`,
+          nowSqliteStyle(),
+        ]
       );
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
-      db.prepare('DELETE FROM user_site_assignments WHERE user_id = ?').run(target.id);
-      db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
-      db.exec('COMMIT;');
+      await deleteClient.query('DELETE FROM sessions WHERE user_id = $1', [target.id]);
+      await deleteClient.query('DELETE FROM user_site_assignments WHERE user_id = $1', [target.id]);
+      await deleteClient.query('DELETE FROM users WHERE id = $1', [target.id]);
+      await deleteClient.query('COMMIT');
       deleted = true;
     } catch (e) {
-      db.exec('ROLLBACK;');
-      fkBlocked = /FOREIGN KEY/i.test(e.message || '');
+      await deleteClient.query('ROLLBACK');
+      // Postgres's foreign-key-violation SQLSTATE code — far more reliable
+      // than the old SQLite message-text check this replaces.
+      fkBlocked = e.code === '23503';
       if (!fkBlocked) throw e; // an unexpected error — never swallow silently
+    } finally {
+      deleteClient.release();
     }
     if (!deleted) {
       return send(
@@ -4401,7 +4397,7 @@ async function handleRequest(req, res) {
             type: 'error',
             message: `${target.username} has attendance, payroll, audit, or other historical records attached and can't be permanently deleted without losing that history. Deactivate the account instead — it stays visible for audit purposes but can no longer log in.`,
           },
-          body: renderUsers({ actingUser: user }),
+          body: await renderUsers({ actingUser: user }),
         })
       );
     }
@@ -4411,7 +4407,7 @@ async function handleRequest(req, res) {
   // ---- Audit log ----
   if (pathname === '/audit-log' && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    return send(res, 200, layout({ title: 'Audit log', user, currentPath: pathname, body: renderAuditLog(query) }));
+    return send(res, 200, layout({ title: 'Audit log', user, currentPath: pathname, body: await renderAuditLog(query) }));
   }
 
   // ---- Site assignments (Project Managers / Site Engineers -> many sites) ----
@@ -4424,7 +4420,7 @@ async function handleRequest(req, res) {
         title: 'Site assignments',
         user,
         currentPath: pathname,
-        body: renderSiteAssignments({ savedSummary: query.saved ? decodeURIComponent(query.saved) : null }),
+        body: await renderSiteAssignments({ savedSummary: query.saved ? decodeURIComponent(query.saved) : null }),
       })
     );
   }
@@ -4436,28 +4432,36 @@ async function handleRequest(req, res) {
     // box gets a unique name). Rebuild every PM/SE's assignment set in a
     // single transaction so the whole page saves atomically — no more losing
     // one person's changes by saving another's.
-    const people = db.prepare(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer')`).all();
+    const people = (await pool.query(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer')`, [])).rows;
     const summaryParts = [];
-    db.exec('BEGIN TRANSACTION');
+    // Same same-client requirement as the user-delete transaction above.
+    const assignClient = await pool.connect();
     try {
-      const del = db.prepare('DELETE FROM user_site_assignments WHERE user_id = ?');
-      const insert = db.prepare('INSERT INTO user_site_assignments (user_id, site_id) VALUES (?, ?)');
+      await assignClient.query('BEGIN');
       for (const p of people) {
         const re = new RegExp(`^u${p.id}_site_(\\d+)$`);
         const siteIds = Object.keys(b)
           .map((k) => k.match(re))
           .filter(Boolean)
           .map((m) => Number(m[1]));
-        del.run(p.id);
-        for (const sid of siteIds) insert.run(p.id, sid);
+        await assignClient.query('DELETE FROM user_site_assignments WHERE user_id = $1', [p.id]);
+        for (const sid of siteIds) {
+          await assignClient.query('INSERT INTO user_site_assignments (user_id, site_id, created_at) VALUES ($1, $2, $3)', [
+            p.id,
+            sid,
+            nowSqliteStyle(),
+          ]);
+        }
         summaryParts.push(`${p.name}: ${siteIds.length} site(s)`);
       }
-      db.exec('COMMIT');
+      await assignClient.query('COMMIT');
     } catch (e) {
-      db.exec('ROLLBACK');
+      await assignClient.query('ROLLBACK');
       throw e;
+    } finally {
+      assignClient.release();
     }
-    logAudit(user.id, 'update', 'site_assignments', null, summaryParts.join(' · '));
+    await logAudit(user.id, 'update', 'site_assignments', null, summaryParts.join(' · '));
     return redirect(res, `/site-assignments?saved=${encodeURIComponent(summaryParts.join(' · '))}`);
   }
 

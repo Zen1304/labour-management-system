@@ -9,7 +9,10 @@
     "seed": "node src/seed.js",
     "backup": "node backup-db.js"
   },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=18.0.0"
   }
 }
