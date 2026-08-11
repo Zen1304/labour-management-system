@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: labour-management-system
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: NODE_VERSION
+        value: 22.13.0
