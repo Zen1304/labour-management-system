@@ -460,7 +460,7 @@ async function siteOptions(selectedId, { excludeId, onlyIds, activeOnly } = {}) 
     .filter((s) => !activeOnly || (s.status === 'active' && s.id !== POOL_SITE_ID))
     .map((s) => {
       const suffix = s.status !== 'active' ? ` (${SITE_STATUS_LABEL[s.status]})` : '';
-      return `<option value="${s.id}" ${String(s.id) === String(selectedId) ? 'selected' : ''}>${s.id} — ${esc(s.name)}${suffix}</option>`;
+      return `<option value="${s.id}" ${String(s.id) === String(selectedId) ? 'selected' : ''}>${esc(s.name)}${suffix}</option>`;
     })
     .join('');
 }
