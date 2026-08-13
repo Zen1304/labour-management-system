@@ -936,7 +936,7 @@ async function renderWorkersList(user, query) {
         <td>${esc(w.name)}</td>
         <td>${esc(w.type_name || '—')}${w.skill_grade ? ` <span class="muted">· ${esc(SKILL_GRADE_LABEL[w.skill_grade] || '')}</span>` : ''}</td>
         <td>${esc(w.vendor_name || '—')}${w.vendor_is_direct ? ' <span class="badge active">Direct</span>' : ''}</td>
-        <td>${w.site_id === POOL_SITE_ID ? '<span class="badge inactive">100 — Pool</span>' : `${w.site_id} — ${esc(w.site_name)}`}</td>
+        <td>${w.site_id === POOL_SITE_ID ? '<span class="badge inactive">Pool</span>' : esc(w.site_name || '—')}</td>
         <td>${esc(w.aadhar_number)}</td>
         <td>${fmtMoney(w.wage_rate)}/hr</td>
         <td><span class="badge ${w.status}">${w.status}</span></td>
@@ -1439,7 +1439,7 @@ async function renderSkillAssessments(user, query, opts) {
         <td class="muted">${esc(w.worker_code || '—')}</td>
         <td>${esc(w.name)}</td>
         <td>${esc(w.type_name || '—')}</td>
-        <td>${w.site_id === POOL_SITE_ID ? '<span class="badge inactive">100 — Pool</span>' : `${w.site_id} — ${esc(w.site_name || '—')}`}</td>
+        <td>${w.site_id === POOL_SITE_ID ? '<span class="badge inactive">Pool</span>' : esc(w.site_name || '—')}</td>
         <td>${catCount ? `<span class="muted">${ratedCount}/${catCount} rated</span>` : '<span class="muted">no categories</span>'}</td>
         <td><a class="btn secondary small" href="/skill-assessments?worker_id=${w.id}&q=${encodeURIComponent(q)}&worker_type_id=${esc(
             typeFilter
@@ -1579,7 +1579,7 @@ async function renderSingleEntry(user, query, opts) {
     const homeLabel = w.site_id === POOL_SITE_ID ? 'Unassigned Pool' : w.site_name || `Site ${w.site_id}`;
     return `<option value="${w.id}" data-home="${esc(homeLabel)}" data-home-id="${esc(w.site_id)}" ${
       String(values.worker_id || '') === String(w.id) ? 'selected' : ''
-    }>${esc(w.name)} — ${w.site_id === POOL_SITE_ID ? 'Unassigned Pool' : `site ${w.site_id}`}</option>`;
+    }>${esc(w.name)} — ${esc(homeLabel)}</option>`;
   };
   const scope = await siteScopeForUser(user);
   let workerOptionsHtml;
@@ -1790,7 +1790,7 @@ async function renderAttendanceHistory(user, query) {
         ${group.rows
           .map(
             (r) => `<tr data-worker="${esc((r.worker_name || '').toLowerCase())}">
-            <td>${esc(r.worker_name)}</td><td>${r.site_id === POOL_SITE_ID ? '<span class="badge inactive">100 — Pool</span>' : `${r.site_id} — ${esc(r.site_name || '—')}`}</td>
+            <td>${esc(r.worker_name)}</td><td>${r.site_id === POOL_SITE_ID ? '<span class="badge inactive">Pool</span>' : esc(r.site_name || '—')}</td>
             <td>${attendanceLabel(r)} ${r.hours_worked}</td><td>${r.leave_hours}</td><td>${r.overtime_hours}</td>
             ${canDelete ? `<td><form class="inline" method="POST" action="/attendance/${r.id}/delete" onsubmit="return confirm('Delete this entry?')"><button class="btn danger small" type="submit">×</button></form></td>` : ''}
           </tr>`
@@ -2529,11 +2529,16 @@ async function renderUsers(opts) {
   (await pool.query('SELECT user_id, site_id FROM user_site_assignments ORDER BY site_id', [])).rows.forEach((r) => {
     (multiSiteAssignments[r.user_id] = multiSiteAssignments[r.user_id] || []).push(r.site_id);
   });
+  const allSitesForNameLookup = (await pool.query('SELECT id, name FROM sites', [])).rows;
+  const siteNameById = {};
+  allSitesForNameLookup.forEach((s) => {
+    siteNameById[s.id] = s.id === POOL_SITE_ID ? 'Pool' : s.name;
+  });
   const siteCellFor = (u) => {
     if (MULTI_SITE_ROLES.includes(u.role)) {
       const ids = multiSiteAssignments[u.id] || [];
       return ids.length
-        ? `${ids.join(', ')} <a href="/site-assignments" class="muted" title="Change on the Site assignments tab">✎</a>`
+        ? `${ids.map((id) => esc(siteNameById[id] || `Site ${id}`)).join(', ')} <a href="/site-assignments" class="muted" title="Change on the Site assignments tab">✎</a>`
         : `<a href="/site-assignments">assign sites →</a>`;
     }
     return esc(u.site_name || '—');
