@@ -52,10 +52,22 @@ CREATE TABLE IF NOT EXISTS sites (
   address TEXT,
   district TEXT,
   state TEXT,
-  maps_link TEXT
+  maps_link TEXT,
+  -- User-entered Project Number (distinct from the internal id above, which
+  -- keeps powering every foreign key/URL/the Unassigned Pool logic
+  -- unchanged). Nullable so the built-in Pool (id 100) and any pre-existing
+  -- site can go without one; enforced unique among sites that do have one
+  -- via the partial index below (NULLs don't collide with each other).
+  project_number INTEGER
 );
 
 ALTER SEQUENCE sites_id_seq OWNED BY sites.id;
+
+-- Additive migration for a database that already has a sites table without
+-- this column (i.e. Zen's live Neon database, which has real data — the
+-- CREATE TABLE IF NOT EXISTS above is a no-op there). Safe/idempotent.
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS project_number INTEGER;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_project_number ON sites(project_number) WHERE project_number IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS vendors (
   id SERIAL PRIMARY KEY,

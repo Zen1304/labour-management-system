@@ -460,6 +460,16 @@ async function findWorkerByAadhar(aadhar, excludeId) {
   return (await pool.query('SELECT * FROM workers WHERE aadhar_number = $1', [aadhar])).rows[0];
 }
 
+// User-entered Project Number on sites — not required to be sequential
+// (unlike the internal 100-999 id, which keeps powering every foreign key/
+// URL unchanged), but must be unique among sites that have one set.
+async function findSiteByProjectNumber(projectNumber, excludeId) {
+  if (excludeId) {
+    return (await pool.query('SELECT * FROM sites WHERE project_number = $1 AND id != $2', [projectNumber, excludeId])).rows[0];
+  }
+  return (await pool.query('SELECT * FROM sites WHERE project_number = $1', [projectNumber])).rows[0];
+}
+
 // ---------- Auto-generated IDs ----------
 // Workers and vendors both get a human-readable code assigned automatically —
 // nobody types these in. Monotonic, based on the highest existing suffix
@@ -2257,31 +2267,35 @@ async function renderSites() {
   const sites = (await pool.query(`SELECT s.*, (SELECT COUNT(*) FROM workers w WHERE w.site_id = s.id) worker_count FROM sites s ORDER BY s.id`, [])).rows;
   return `
   <h1>Sites</h1>
-  <p class="subtitle">Site numbers run 100–999. Site 100 is the built-in Unassigned Pool that new workers land in by default.</p>
+  <p class="subtitle">Project # is a number you assign (not required to be sequential). Site 100 is the built-in Unassigned Pool that new workers land in by default.</p>
   <div class="card">
     <form method="POST" action="/sites">
       <div class="form-row">
+        <div><label>Project number</label><input name="project_number" type="number" step="1" required placeholder="e.g. 140"></div>
         <div><label>Site name</label><input name="name" required></div>
+      </div>
+      <div class="form-row">
         <div><label>Location</label><input name="location"></div>
-      </div>
-      <div class="form-row">
         <div><label>Address (optional)</label><input name="address" placeholder="e.g. Plot 12, MG Road"></div>
-        <div><label>District (optional)</label><input name="district"></div>
       </div>
       <div class="form-row">
+        <div><label>District (optional)</label><input name="district"></div>
         <div><label>State (optional)</label><input name="state"></div>
+      </div>
+      <div class="form-row">
         <div><label>Google Maps link (optional)</label><input name="maps_link" type="url" placeholder="https://maps.google.com/..."></div>
+        <div></div>
       </div>
       <button class="btn" type="submit">Add site</button>
     </form>
   </div>
   <div class="table-wrap"><table>
-    <tr><th>#</th><th>Name</th><th>Location</th><th>District/State</th><th>Status</th><th>Workers</th><th></th></tr>
+    <tr><th>Project #</th><th>Name</th><th>Location</th><th>District/State</th><th>Status</th><th>Workers</th><th></th></tr>
     ${sites
       .map((s) => {
         const districtState = [s.district, s.state].filter(Boolean).join(', ');
         return `<tr>
-        <td>${s.id}</td><td>${esc(s.name)}${s.id === POOL_SITE_ID ? ' <span class="badge inactive">Pool</span>' : ''}</td><td>${esc(
+        <td>${s.project_number != null ? s.project_number : '<span class="muted">—</span>'}</td><td>${esc(s.name)}${s.id === POOL_SITE_ID ? ' <span class="badge inactive">Pool</span>' : ''}</td><td>${esc(
           s.location || '—'
         )}</td>
         <td>${esc(districtState || '—')}</td>
@@ -2309,16 +2323,22 @@ async function renderSiteForm(site) {
   <div class="card">
   <form method="POST" action="/sites/${site.id}">
     <div class="form-row">
+      <div><label>Project number${site.id === POOL_SITE_ID ? ' (optional)' : ''}</label><input name="project_number" type="number" step="1" ${
+    site.id === POOL_SITE_ID ? '' : 'required'
+  } value="${site.project_number != null ? site.project_number : ''}"></div>
       <div><label>Site name</label><input name="name" required value="${esc(site.name)}"></div>
+    </div>
+    <div class="form-row">
       <div><label>Location</label><input name="location" value="${esc(site.location)}"></div>
-    </div>
-    <div class="form-row">
       <div><label>Address (optional)</label><input name="address" value="${esc(site.address)}"></div>
-      <div><label>District (optional)</label><input name="district" value="${esc(site.district)}"></div>
     </div>
     <div class="form-row">
+      <div><label>District (optional)</label><input name="district" value="${esc(site.district)}"></div>
       <div><label>State (optional)</label><input name="state" value="${esc(site.state)}"></div>
+    </div>
+    <div class="form-row">
       <div><label>Google Maps link (optional)</label><input name="maps_link" type="url" value="${esc(site.maps_link)}"></div>
+      <div></div>
     </div>
     ${site.maps_link ? `<p class="hint" style="margin-top:-6px"><a href="${esc(site.maps_link)}" target="_blank" rel="noopener">Open in Google Maps →</a></p>` : ''}
     <label>Status</label>
@@ -3945,11 +3965,26 @@ async function handleRequest(req, res) {
   if (pathname === '/sites' && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
     const b = reqBody;
+    const projectNumber = b.project_number != null && b.project_number !== '' ? parseInt(b.project_number, 10) : null;
+    if (projectNumber === null || !Number.isInteger(projectNumber)) {
+      return send(
+        res,
+        400,
+        layout({ title: 'Sites', user, currentPath: pathname, flash: { type: 'error', message: 'Project number is required and must be a whole number.' }, body: await renderSites() })
+      );
+    }
+    if (await findSiteByProjectNumber(projectNumber)) {
+      return send(
+        res,
+        400,
+        layout({ title: 'Sites', user, currentPath: pathname, flash: { type: 'error', message: `Project number ${projectNumber} is already in use by another site.` }, body: await renderSites() })
+      );
+    }
     const newSiteInfo = await pool.query(
-      'INSERT INTO sites (name, location, address, district, state, maps_link) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-      [b.name, b.location || null, b.address || null, b.district || null, b.state || null, b.maps_link || null]
+      'INSERT INTO sites (name, location, address, district, state, maps_link, project_number) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+      [b.name, b.location || null, b.address || null, b.district || null, b.state || null, b.maps_link || null, projectNumber]
     );
-    await logAudit(user.id, 'create', 'site', newSiteInfo.rows[0].id, b.name);
+    await logAudit(user.id, 'create', 'site', newSiteInfo.rows[0].id, `${b.name} (Project #${projectNumber})`);
     return redirect(res, '/sites');
   }
   const siteEditMatch = pathname.match(/^\/sites\/(\d+)\/edit$/);
@@ -3966,17 +4001,44 @@ async function handleRequest(req, res) {
     if (!s) return send(res, 404, 'Not found');
     const b = reqBody;
     const status = ['active', 'on_hold', 'completed'].includes(b.status) ? b.status : 'active';
-    (await pool.query('UPDATE sites SET name = $1, location = $2, status = $3, address = $4, district = $5, state = $6, maps_link = $7 WHERE id = $8', [
-      b.name,
-      b.location || null,
-      status,
-      b.address || null,
-      b.district || null,
-      b.state || null,
-      b.maps_link || null,
-      siteUpdateMatch[1]
-    ]));
-    await logAudit(user.id, 'update', 'site', siteUpdateMatch[1], b.name);
+    const projectNumber = b.project_number != null && b.project_number !== '' ? parseInt(b.project_number, 10) : null;
+    // The Pool (id 100) is allowed to go without a project number; every
+    // other site must have one, matching the "required" attribute on the
+    // edit form.
+    if (s.id !== POOL_SITE_ID && (projectNumber === null || !Number.isInteger(projectNumber))) {
+      return send(
+        res,
+        400,
+        layout({
+          title: 'Edit site',
+          user,
+          currentPath: '/sites',
+          flash: { type: 'error', message: 'Project number is required and must be a whole number.' },
+          body: await renderSiteForm(Object.assign({}, s, b, { id: s.id })),
+        })
+      );
+    }
+    if (projectNumber !== null) {
+      const clash = await findSiteByProjectNumber(projectNumber, s.id);
+      if (clash) {
+        return send(
+          res,
+          400,
+          layout({
+            title: 'Edit site',
+            user,
+            currentPath: '/sites',
+            flash: { type: 'error', message: `Project number ${projectNumber} is already in use by another site.` },
+            body: await renderSiteForm(Object.assign({}, s, b, { id: s.id })),
+          })
+        );
+      }
+    }
+    (await pool.query(
+      'UPDATE sites SET name = $1, location = $2, status = $3, address = $4, district = $5, state = $6, maps_link = $7, project_number = $8 WHERE id = $9',
+      [b.name, b.location || null, status, b.address || null, b.district || null, b.state || null, b.maps_link || null, projectNumber, siteUpdateMatch[1]]
+    ));
+    await logAudit(user.id, 'update', 'site', siteUpdateMatch[1], `${b.name}${projectNumber != null ? ` (Project #${projectNumber})` : ''}`);
     return redirect(res, '/sites');
   }
   // Site hard-delete was removed per Zen's request (v9, same policy as
