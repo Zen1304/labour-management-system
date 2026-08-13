@@ -206,6 +206,26 @@ async function noEligibleSiteNotice(user) {
   }${statusText}. Ask an administrator to set it back to Active if work has resumed. Existing attendance history is unaffected.</div>`;
 }
 
+// Sum of hours_worked + overtime_hours a worker already has logged on a given
+// date, across every OTHER site (excludeSiteId is the site currently being
+// written — its existing row, if any, is about to be replaced by the new
+// value, not added on top of it). Used to enforce the 10-hour daily cap
+// across a worker's whole day, not just the single site/row being submitted
+// — a worker splitting time across two sites in one day was previously able
+// to log up to 10 hours at EACH site (20+ total) because the cap only ever
+// looked at the row being saved.
+async function workerHoursOnDateExcludingSite(workerId, date, excludeSiteId) {
+  const row = (
+    await pool.query(
+      `SELECT COALESCE(SUM(hours_worked + overtime_hours), 0) total
+       FROM attendance
+       WHERE worker_id = $1 AND date = $2 AND site_id != $3`,
+      [workerId, date, excludeSiteId]
+    )
+  ).rows[0];
+  return Number(row.total) || 0;
+}
+
 // A worker recorded somewhere other than their home site is legitimate (that's
 // the split-site case) but worth a trail, so it can be reviewed rather than
 // merely trusted.
@@ -3614,9 +3634,19 @@ async function handleRequest(req, res) {
       if (workerError) return bulkReject(`${workerError} Nothing was saved.`);
       const hours = parseFloat(b[`hours_${workerId}`]) || 0;
       const ot = parseFloat(b[`ot_${workerId}`]) || 0;
-      if (hours + ot > 10) {
+      // Checked against this row alone AND against the worker's total across
+      // every other site logged for the same date — a worker who already has
+      // hours recorded at a different site today must not be able to push
+      // their combined day over 10 hours here, even though each individual
+      // site's row stays under the cap on its own.
+      const otherSitesTotal = await workerHoursOnDateExcludingSite(workerId, date, siteId);
+      if (hours + ot > 10 || otherSitesTotal + hours + ot > 10) {
+        const worker = (await pool.query('SELECT name FROM workers WHERE id = $1', [workerId])).rows[0];
+        const workerName = worker ? worker.name : `worker ${workerId}`;
         return bulkReject(
-          `Hours worked + overtime can't exceed 10 hours in a day for any worker. Nothing was saved — fix the highlighted row(s) and resubmit.`
+          otherSitesTotal > 0
+            ? `${workerName} already has ${otherSitesTotal}h logged at another site on ${date} — this entry would push their total for the day over 10 hours. Nothing was saved — fix the highlighted row(s) and resubmit.`
+            : `Hours worked + overtime can't exceed 10 hours in a day for any worker. Nothing was saved — fix the highlighted row(s) and resubmit.`
         );
       }
     }
@@ -3664,7 +3694,12 @@ async function handleRequest(req, res) {
     // before the hours check so a request that names an ineligible worker or
     // site is rejected whatever its hours say.
     const entryError = await attendanceWriteError(user, b);
-    if (entryError || hours + ot > 10) {
+    // Same cross-site total check as the bulk grid — a worker who already has
+    // hours logged at a different site on this date must not be able to push
+    // their combined day over 10 hours via a single-entry save either.
+    const otherSitesTotal = entryError ? 0 : await workerHoursOnDateExcludingSite(b.worker_id, b.date, b.site_id);
+    const overCap = hours + ot > 10 || otherSitesTotal + hours + ot > 10;
+    if (entryError || overCap) {
       return send(
         res,
         400,
@@ -3674,7 +3709,11 @@ async function handleRequest(req, res) {
           currentPath: '/attendance',
           flash: {
             type: 'error',
-            message: entryError || "Hours worked + overtime can't exceed 10 hours in a day. Nothing was saved.",
+            message:
+              entryError ||
+              (otherSitesTotal > 0
+                ? `This worker already has ${otherSitesTotal}h logged at another site on ${b.date} — this entry would push their total for the day over 10 hours. Nothing was saved.`
+                : "Hours worked + overtime can't exceed 10 hours in a day. Nothing was saved."),
           },
           // Re-render the single-entry page (where this form now lives) with
           // what was typed still in the fields, so a rejected submission
