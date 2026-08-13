@@ -470,11 +470,6 @@ async function siteOptions(selectedId, { excludeId, onlyIds, activeOnly } = {}) 
     })
     .join('');
 }
-function skillGradeOptions(selected) {
-  return Object.entries(SKILL_GRADE_LABEL)
-    .map(([val, label]) => `<option value="${val}" ${val === (selected || 'skilled') ? 'selected' : ''}>${label}</option>`)
-    .join('');
-}
 async function directVendorId() {
   const v = (await pool.query('SELECT id FROM vendors WHERE is_direct = 1 LIMIT 1', [])).rows[0];
   return v ? v.id : null;
@@ -945,7 +940,7 @@ async function renderWorkersList(user, query) {
         (w) => `<tr>
         <td class="muted">${esc(w.worker_code || '—')}</td>
         <td>${esc(w.name)}</td>
-        <td>${esc(w.type_name || '—')}${w.skill_grade ? ` <span class="muted">· ${esc(SKILL_GRADE_LABEL[w.skill_grade] || '')}</span>` : ''}</td>
+        <td>${esc(w.type_name || '—')}</td>
         <td>${esc(w.vendor_name || '—')}${w.vendor_is_direct ? ' <span class="badge active">Direct</span>' : ''}</td>
         <td>${w.site_id === POOL_SITE_ID ? '<span class="badge inactive">Pool</span>' : esc(w.site_name || '—')}</td>
         <td>${esc(w.aadhar_number)}</td>
@@ -994,7 +989,7 @@ async function renderWorkerForm(worker, opts) {
       <div><label>Vendor</label><select name="vendor_id" required><option value="">Select vendor…</option>${await vendorOptions(
         w.vendor_id
       )}</select></div>
-      <div><label>Skill grade</label><select name="skill_grade">${skillGradeOptions(w.skill_grade)}</select></div>
+      <div></div>
     </div>
     ${
       isEdit && !isAlreadyDirect && directId
@@ -3127,8 +3122,14 @@ async function handleRequest(req, res) {
       );
     }
     const newWorkerInfo = await pool.query(
-      `INSERT INTO workers (worker_code, name, worker_type_id, vendor_id, aadhar_number, site_id, wage_rate, overtime_multiplier, contact, status, skill_grade, verification_status, joined_date, created_at)
-       VALUES ($1, $2, $3, $4, $5, ${POOL_SITE_ID}, $6, $7, $8, 'active', $9, 'pending', $10, $11) RETURNING id`,
+      // skill_grade is intentionally omitted here — it's a retired
+      // overall-grade field (see the note above renderSkillCategories);
+      // the column stays in the DB (defaulting to 'skilled') purely so old
+      // rows and the CHECK constraint keep working, but new workers no
+      // longer set it, and per-worker skill is now captured by the
+      // per-category ratings on the Skill assessments page instead.
+      `INSERT INTO workers (worker_code, name, worker_type_id, vendor_id, aadhar_number, site_id, wage_rate, overtime_multiplier, contact, status, verification_status, joined_date, created_at)
+       VALUES ($1, $2, $3, $4, $5, ${POOL_SITE_ID}, $6, $7, $8, 'active', 'pending', $9, $10) RETURNING id`,
       [
         await nextWorkerCode(),
         b.name,
@@ -3138,7 +3139,6 @@ async function handleRequest(req, res) {
         wageRate,
         parseFloat(b.overtime_multiplier) || 1.5,
         contactDigits,
-        b.skill_grade || 'skilled',
         b.joined_date || todayStr(),
         nowSqliteStyle(),
       ]
@@ -3222,10 +3222,15 @@ async function handleRequest(req, res) {
         })
       );
     }
+    // skill_grade is deliberately left out of this UPDATE — the form no
+    // longer submits it (retired in favor of the per-category ratings on
+    // Skill assessments), so leaving it out of the SET clause preserves
+    // whatever value an existing row already has instead of silently
+    // resetting it to the default on every edit.
     await pool.query(
       `UPDATE workers SET name=$1, worker_type_id=$2, vendor_id=$3, aadhar_number=$4,
-        site_id=$5, wage_rate=$6, overtime_multiplier=$7, contact=$8, status=$9, skill_grade=$10, joined_date=$11
-       WHERE id=$12`,
+        site_id=$5, wage_rate=$6, overtime_multiplier=$7, contact=$8, status=$9, joined_date=$10
+       WHERE id=$11`,
       [
         b.name,
         b.worker_type_id || null,
@@ -3236,7 +3241,6 @@ async function handleRequest(req, res) {
         parseFloat(b.overtime_multiplier) || 1.5,
         editContactDigits,
         b.status || 'active',
-        b.skill_grade || 'skilled',
         b.joined_date || todayStr(),
         id,
       ]
