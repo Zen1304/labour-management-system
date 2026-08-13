@@ -189,8 +189,12 @@ async function attendanceWriteError(user, { worker_id, site_id, date }) {
 // a site-scoped user *why* they're blocked instead of just refusing the save.
 async function eligibleAttendanceSites(user) {
   const scope = await siteScopeForUser(user);
-  return (await pool.query(`SELECT id, name, status FROM sites WHERE status = 'active' AND id != ${POOL_SITE_ID} ORDER BY id`, [])).rows
-    .filter((s) => scope === null || scope.includes(Number(s.id)));
+  return (
+    await pool.query(
+      `SELECT id, name, status FROM sites WHERE status = 'active' AND id != ${POOL_SITE_ID} ORDER BY project_number NULLS LAST, name`,
+      []
+    )
+  ).rows.filter((s) => scope === null || scope.includes(Number(s.id)));
 }
 
 // A site-scoped user whose only site is on hold or completed can't mark
@@ -453,7 +457,9 @@ const SKILL_GRADE_LABEL = { trainee: 'Trainee', skilled: 'Skilled', expert: 'Exp
 // the attendance pages never offer a choice the server would reject. Left off
 // everywhere else, where picking an on-hold/completed site is still valid.
 async function siteOptions(selectedId, { excludeId, onlyIds, activeOnly } = {}) {
-  const sites = (await pool.query('SELECT * FROM sites ORDER BY id', [])).rows;
+  const sites = (
+    await pool.query(`SELECT * FROM sites ORDER BY (id = ${POOL_SITE_ID}) DESC, project_number NULLS LAST, name`, [])
+  ).rows;
   return sites
     .filter((s) => !excludeId || s.id !== Number(excludeId))
     .filter((s) => !onlyIds || onlyIds.includes(s.id))
@@ -585,7 +591,12 @@ async function attendanceTrendChart(days) {
   const from = dates[0];
   const to = dates[dates.length - 1];
 
-  const sites = (await pool.query(`SELECT id, name FROM sites WHERE id != ${POOL_SITE_ID} ORDER BY id`, [])).rows;
+  const sites = (
+    await pool.query(
+      `SELECT id, name FROM sites WHERE id != ${POOL_SITE_ID} ORDER BY project_number NULLS LAST, name`,
+      []
+    )
+  ).rows;
   const activeCounts = (await pool.query(`SELECT site_id, COUNT(*) c FROM workers WHERE status = 'active' GROUP BY site_id`, [])).rows
     .reduce((m, r) => ((m[r.site_id] = r.c), m), {});
   const presentRows = (await pool.query(
@@ -756,7 +767,7 @@ async function renderDashboard(user) {
          LEFT JOIN workers w ON w.site_id = s.id AND w.status='active'
          LEFT JOIN attendance a ON a.worker_id = w.id AND a.site_id = s.id
          WHERE 1=1 ${siteRowScope}
-         GROUP BY s.id ORDER BY s.id`,
+         GROUP BY s.id ORDER BY (s.id = ${POOL_SITE_ID}) DESC, s.project_number NULLS LAST, s.name`,
         [today]
       )
     ).rows;
@@ -767,7 +778,7 @@ async function renderDashboard(user) {
       ${rows
         .map(
           (r) =>
-            `<tr><td>${r.id === POOL_SITE_ID ? '<span class="badge inactive">100 — Unassigned Pool</span>' : `${r.id} — ${esc(r.name)}`}</td><td>${r.worker_count}</td><td>${r.present_today || 0}</td></tr>`
+            `<tr><td>${r.id === POOL_SITE_ID ? '<span class="badge inactive">Unassigned Pool</span>' : esc(r.name)}</td><td>${r.worker_count}</td><td>${r.present_today || 0}</td></tr>`
         )
         .join('')}
       ${rows.length === 0 ? '<tr><td colspan="3" class="muted">No sites yet.</td></tr>' : ''}
@@ -2284,7 +2295,13 @@ async function renderPayrollItemDetail(itemId, viewer) {
 
 // ---------- Sites ----------
 async function renderSites() {
-  const sites = (await pool.query(`SELECT s.*, (SELECT COUNT(*) FROM workers w WHERE w.site_id = s.id) worker_count FROM sites s ORDER BY s.id`, [])).rows;
+  const sites = (
+    await pool.query(
+      `SELECT s.*, (SELECT COUNT(*) FROM workers w WHERE w.site_id = s.id) worker_count FROM sites s
+       ORDER BY (s.id = ${POOL_SITE_ID}) DESC, s.project_number NULLS LAST, s.name`,
+      []
+    )
+  ).rows;
   return `
   <h1>Sites</h1>
   <p class="subtitle">Project # is a number you assign (not required to be sequential). Site 100 is the built-in Unassigned Pool that new workers land in by default.</p>
@@ -2730,7 +2747,9 @@ async function renderAuditLog(query) {
 // ---------- Site assignments (Project Managers / Site Engineers) ----------
 async function renderSiteAssignments(opts) {
   const people = (await pool.query(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer') ORDER BY role, name`, [])).rows;
-  const sites = (await pool.query('SELECT * FROM sites ORDER BY id', [])).rows;
+  const sites = (
+    await pool.query(`SELECT * FROM sites ORDER BY (id = ${POOL_SITE_ID}) DESC, project_number NULLS LAST, name`, [])
+  ).rows;
   const assignedMap = {}; // user_id -> Set(site_id)
   (await pool.query('SELECT user_id, site_id FROM user_site_assignments', [])).rows.forEach((r) => {
     if (!assignedMap[r.user_id]) assignedMap[r.user_id] = new Set();
