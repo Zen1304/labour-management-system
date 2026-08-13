@@ -58,16 +58,21 @@ CREATE TABLE IF NOT EXISTS sites (
   -- unchanged). Nullable so the built-in Pool (id 100) and any pre-existing
   -- site can go without one; enforced unique among sites that do have one
   -- via the partial index below (NULLs don't collide with each other).
-  project_number INTEGER
+  project_number INTEGER,
+  -- Purely a display/reference field — "which client is this site for" —
+  -- separate from name/project_number, not used anywhere else in the app
+  -- (no uniqueness requirement, doesn't appear in dropdowns or charts).
+  client_name TEXT
 );
 
 ALTER SEQUENCE sites_id_seq OWNED BY sites.id;
 
 -- Additive migration for a database that already has a sites table without
--- this column (i.e. Zen's live Neon database, which has real data — the
+-- these columns (i.e. Zen's live Neon database, which has real data — the
 -- CREATE TABLE IF NOT EXISTS above is a no-op there). Safe/idempotent.
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS project_number INTEGER;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_project_number ON sites(project_number) WHERE project_number IS NOT NULL;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS client_name TEXT;
 
 CREATE TABLE IF NOT EXISTS vendors (
   id SERIAL PRIMARY KEY,

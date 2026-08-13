@@ -2295,27 +2295,29 @@ async function renderSites() {
         <div><label>Site name</label><input name="name" required></div>
       </div>
       <div class="form-row">
+        <div><label>Client name (optional)</label><input name="client_name" placeholder="e.g. Acme Builders"></div>
         <div><label>Location</label><input name="location"></div>
+      </div>
+      <div class="form-row">
         <div><label>Address (optional)</label><input name="address" placeholder="e.g. Plot 12, MG Road"></div>
-      </div>
-      <div class="form-row">
         <div><label>District (optional)</label><input name="district"></div>
-        <div><label>State (optional)</label><input name="state"></div>
       </div>
       <div class="form-row">
+        <div><label>State (optional)</label><input name="state"></div>
         <div><label>Google Maps link (optional)</label><input name="maps_link" type="url" placeholder="https://maps.google.com/..."></div>
-        <div></div>
       </div>
       <button class="btn" type="submit">Add site</button>
     </form>
   </div>
   <div class="table-wrap"><table>
-    <tr><th>Project #</th><th>Name</th><th>Location</th><th>District/State</th><th>Status</th><th>Workers</th><th></th></tr>
+    <tr><th>Project #</th><th>Name</th><th>Client</th><th>Location</th><th>District/State</th><th>Status</th><th>Workers</th><th></th></tr>
     ${sites
       .map((s) => {
         const districtState = [s.district, s.state].filter(Boolean).join(', ');
         return `<tr>
-        <td>${s.project_number != null ? s.project_number : '<span class="muted">—</span>'}</td><td>${esc(s.name)}${s.id === POOL_SITE_ID ? ' <span class="badge inactive">Pool</span>' : ''}</td><td>${esc(
+        <td>${s.project_number != null ? s.project_number : '<span class="muted">—</span>'}</td><td>${esc(s.name)}${s.id === POOL_SITE_ID ? ' <span class="badge inactive">Pool</span>' : ''}</td>
+        <td>${esc(s.client_name || '—')}</td>
+        <td>${esc(
           s.location || '—'
         )}</td>
         <td>${esc(districtState || '—')}</td>
@@ -2327,7 +2329,7 @@ async function renderSites() {
       </tr>`;
       })
       .join('')}
-    ${sites.length === 0 ? '<tr><td colspan="7" class="muted">No sites yet.</td></tr>' : ''}
+    ${sites.length === 0 ? '<tr><td colspan="8" class="muted">No sites yet.</td></tr>' : ''}
   </table></div>
   <p class="hint">Sites are never permanently deleted — mark one Completed (its Edit page) when work wraps up there. Completed sites stay fully visible here and their attendance history remains searchable by date range in <a href="/attendance/history">Attendance History</a>; reassign a site's active workers to another site first if it still has any.</p>
   `;
@@ -2349,7 +2351,10 @@ async function renderSiteForm(site) {
       <div><label>Site name</label><input name="name" required value="${esc(site.name)}"></div>
     </div>
     <div class="form-row">
+      <div><label>Client name (optional)</label><input name="client_name" placeholder="e.g. Acme Builders" value="${esc(site.client_name)}"></div>
       <div><label>Location</label><input name="location" value="${esc(site.location)}"></div>
+    </div>
+    <div class="form-row">
       <div><label>Address (optional)</label><input name="address" value="${esc(site.address)}"></div>
     </div>
     <div class="form-row">
@@ -4020,8 +4025,8 @@ async function handleRequest(req, res) {
       );
     }
     const newSiteInfo = await pool.query(
-      'INSERT INTO sites (name, location, address, district, state, maps_link, project_number) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
-      [b.name, b.location || null, b.address || null, b.district || null, b.state || null, b.maps_link || null, projectNumber]
+      'INSERT INTO sites (name, location, address, district, state, maps_link, project_number, client_name) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+      [b.name, b.location || null, b.address || null, b.district || null, b.state || null, b.maps_link || null, projectNumber, b.client_name || null]
     );
     await logAudit(user.id, 'create', 'site', newSiteInfo.rows[0].id, `${b.name} (Project #${projectNumber})`);
     return redirect(res, '/sites');
@@ -4074,8 +4079,8 @@ async function handleRequest(req, res) {
       }
     }
     (await pool.query(
-      'UPDATE sites SET name = $1, location = $2, status = $3, address = $4, district = $5, state = $6, maps_link = $7, project_number = $8 WHERE id = $9',
-      [b.name, b.location || null, status, b.address || null, b.district || null, b.state || null, b.maps_link || null, projectNumber, siteUpdateMatch[1]]
+      'UPDATE sites SET name = $1, location = $2, status = $3, address = $4, district = $5, state = $6, maps_link = $7, project_number = $8, client_name = $9 WHERE id = $10',
+      [b.name, b.location || null, status, b.address || null, b.district || null, b.state || null, b.maps_link || null, projectNumber, b.client_name || null, siteUpdateMatch[1]]
     ));
     await logAudit(user.id, 'update', 'site', siteUpdateMatch[1], `${b.name}${projectNumber != null ? ` (Project #${projectNumber})` : ''}`);
     return redirect(res, '/sites');
