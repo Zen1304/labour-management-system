@@ -58,7 +58,7 @@ function layout({ title, user, currentPath, body, flash, theme, csrfToken }) {
     ? `
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-mark">L</span>
+        <img src="/logo-white.png" alt="Bilara Group" class="brand-logo">
         <span class="brand-name">Labour<br>Management</span>
       </div>
       <nav class="nav">
@@ -135,6 +135,7 @@ function layout({ title, user, currentPath, body, flash, theme, csrfToken }) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="csrf-token" content="${esc(csrfToken || '')}">
 <title>${esc(title)} · LMS</title>
+<link rel="icon" type="image/png" href="/logo-black.png">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body class="${user ? 'has-sidebar' : ''}">

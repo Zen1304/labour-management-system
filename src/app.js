@@ -16,7 +16,7 @@ const { parseCookies, parseFormBody, todayStr } = require('./helpers');
 const { svgLineChart, svgBarChart, miniBar } = require('./charts');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-const MIME = { '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml' };
+const MIME = { '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
 const POOL_SITE_ID = 100;
 // Off by default so a plain local HTTP deployment (the documented normal
 // case for this internal LAN app) never breaks login by asking the browser
@@ -2805,7 +2805,10 @@ async function handleRequest(req, res) {
   const pathname = url.pathname;
   const query = Object.fromEntries(url.searchParams.entries());
 
-  if (req.method === 'GET' && (pathname === '/style.css' || pathname.startsWith('/assets/'))) {
+  if (
+    req.method === 'GET' &&
+    (pathname === '/style.css' || pathname.startsWith('/assets/') || /^\/[\w-]+\.(png|ico|svg)$/.test(pathname))
+  ) {
     if (serveStatic(req, res, pathname)) return;
   }
 
@@ -2915,7 +2918,10 @@ async function handleRequest(req, res) {
         body: `
         <div class="login-wrap">
           <div class="card">
-            <div class="login-brand"><span class="brand-mark" style="width:48px;height:48px;min-width:48px;font-size:22px;border-radius:14px">L</span></div>
+            <div class="login-brand">
+              <img src="/logo-black.png" alt="Bilara Group" class="login-logo login-logo-light">
+              <img src="/logo-white.png" alt="Bilara Group" class="login-logo login-logo-dark">
+            </div>
             <h1>Labour Management System</h1>
             <p class="subtitle">Sign in to continue</p>
             ${query.error ? `<div class="flash flash-error">${esc(query.error)}</div>` : ''}

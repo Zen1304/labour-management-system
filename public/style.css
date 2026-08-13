@@ -117,6 +117,7 @@ a:hover { text-decoration: underline; }
   font-size: 17px;
   box-shadow: 0 4px 14px rgba(79, 70, 229, 0.4);
 }
+.brand-logo { height: 34px; width: auto; }
 .brand-name {
   font-weight: 800;
   font-size: 14px;
@@ -350,6 +351,14 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--p
   justify-content: center;
   margin-bottom: 18px;
 }
+.login-logo { height: 64px; width: auto; }
+/* Only one of the two logo variants is shown at a time, matched to the
+   login card's background so the wordmark stays legible — the black
+   logo on the light-theme white card, the white logo on the dark-theme
+   panel. Simpler than re-coloring the PNG client-side. */
+.login-logo-dark { display: none; }
+html[data-theme='dark'] .login-logo-light { display: none; }
+html[data-theme='dark'] .login-logo-dark { display: inline-block; }
 .hint { font-size: 12.5px; color: var(--muted); margin-top: 8px; line-height: 1.55; }
 
 .muted { color: var(--muted); }
