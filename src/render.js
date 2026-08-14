@@ -65,7 +65,12 @@ function layout({ title, user, currentPath, body, flash, theme, csrfToken }) {
         ${navGroup(
           'Overview',
           [
-            navLink('/', 'Dashboard', currentPath, '&#9673;'),
+            navLink(
+              '/',
+              user.role === 'project_manager' ? 'My Projects' : user.role === 'site_engineer' ? 'My Sites' : 'Dashboard',
+              currentPath,
+              '&#9673;'
+            ),
             navLink('/workers', 'Workers', currentPath, '&#128101;'),
             can(user, 'workers.skill_assess') ? navLink('/skill-assessments', 'Skill assessments', currentPath, '&#127942;') : '',
             can(user, 'attendance.mark')

@@ -717,6 +717,78 @@ async function vendorComparisonRows(days) {
   return { rows, maxPaid };
 }
 
+// ---------- Project Manager / Site Engineer landing pages (v11) ----------
+// Per Zen: PM and SE previously landed on the same generic Dashboard
+// everyone else sees (a plain "Sites overview" table, already scoped to
+// their assigned sites via siteScopeForUser — the data was right, but it
+// read the same as everyone else's page). These give each role its own,
+// visually distinct home: a card per assigned site instead of a table row,
+// with straight-through links into that site's Workers/Attendance —
+// exactly what "read-only oversight" already meant, just easier to scan at
+// a glance. Same underlying query shape for both roles (they differ only in
+// how many sites they typically cover), so one function serves both,
+// switching only the page's own language.
+async function renderSiteOverseerHome(user) {
+  const roleIsPM = user.role === 'project_manager';
+  const heading = roleIsPM ? 'My Projects' : 'My Sites';
+  const today = todayStr();
+  const scope = await siteScopeForUser(user); // array of site ids (PM/SE always get an array, never null)
+
+  if (!scope || scope.length === 0) {
+    return `
+    <h1>${heading}</h1>
+    <p class="subtitle">${esc(today)} · ${esc(ROLE_LABEL[user.role])} view</p>
+    <div class="card muted">You haven't been assigned to any sites yet — ask an admin to assign you on <a href="/site-assignments">Site assignments</a>.</div>`;
+  }
+
+  const siteFilter = siteScopeClause('s.id', scope);
+  const rows = (
+    await pool.query(
+      `SELECT s.id, s.name, s.project_number, s.client_name, s.status,
+        COUNT(DISTINCT w.id) worker_count,
+        COUNT(DISTINCT CASE WHEN a.date = $1 AND a.hours_worked > 0 THEN a.worker_id END) present_today
+       FROM sites s
+       LEFT JOIN workers w ON w.site_id = s.id AND w.status = 'active'
+       LEFT JOIN attendance a ON a.worker_id = w.id AND a.site_id = s.id
+       WHERE 1=1 ${siteFilter}
+       GROUP BY s.id ORDER BY s.project_number NULLS LAST, s.name`,
+      [today]
+    )
+  ).rows;
+
+  const totalWorkers = rows.reduce((sum, r) => sum + Number(r.worker_count), 0);
+  const totalPresent = rows.reduce((sum, r) => sum + Number(r.present_today), 0);
+  const attendancePct = totalWorkers > 0 ? Math.round((totalPresent / totalWorkers) * 100) : 0;
+
+  return `
+  <h1>${heading}</h1>
+  <p class="subtitle">${esc(today)} · ${esc(ROLE_LABEL[user.role])} view · read-only oversight of ${rows.length} site(s)</p>
+  <div class="grid grid-3" style="margin-bottom:24px">
+    <div class="stat"><div class="stat-label">Sites</div><div class="stat-value">${rows.length}</div></div>
+    <div class="stat"><div class="stat-label">Active workers</div><div class="stat-value">${totalWorkers}</div></div>
+    <div class="stat"><div class="stat-label">Present today</div><div class="stat-value">${totalPresent}</div><div class="stat-sub">${attendancePct}% of workforce</div></div>
+  </div>
+  <div class="grid grid-3">
+    ${rows
+      .map(
+        (r) => `
+    <div class="card site-overview-card">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px">
+        <h3 style="margin:0 0 2px">${r.project_number != null ? `<span class="muted">${esc(String(r.project_number))} · </span>` : ''}${esc(r.name)}</h3>
+        ${r.status !== 'active' ? `<span class="badge ${SITE_STATUS_BADGE[r.status]}">${esc(SITE_STATUS_LABEL[r.status])}</span>` : ''}
+      </div>
+      ${r.client_name ? `<p class="muted" style="margin:0 0 12px;font-size:13px">${esc(r.client_name)}</p>` : '<div style="margin-bottom:12px"></div>'}
+      <p style="margin:0"><b>${r.worker_count}</b> active worker(s) · <b>${r.present_today || 0}</b> present today</p>
+      <div class="actions" style="margin-top:14px">
+        <a href="/workers?site_id=${r.id}" class="btn secondary small">Workers →</a>
+        <a href="/attendance/history?site_id=${r.id}" class="btn secondary small">Attendance →</a>
+      </div>
+    </div>`
+      )
+      .join('')}
+  </div>`;
+}
+
 async function renderDashboard(user) {
   const today = todayStr();
   const scope = await siteScopeForUser(user);
@@ -2783,19 +2855,28 @@ async function renderSiteAssignments(opts) {
       .map((p) => {
         const assigned = assignedMap[p.id] || new Set();
         return `
-    <div class="card assignment-card" data-user="${p.id}">
-      <h2 class="mt-0" style="margin-top:0">${esc(p.name)} <span class="muted" style="font-weight:400">· ${esc(ROLE_LABEL[p.role])} · <span class="assign-count" data-count-for="${p.id}">${assigned.size}</span> site(s)</span> <span class="badge half_day" data-dirty-for="${p.id}" style="display:none">unsaved changes</span></h2>
-      <div class="grid grid-4">
-        ${sites
-          .map(
-            (s) =>
-              `<label style="text-transform:none;font-weight:400;display:flex;align-items:center;gap:6px"><input type="checkbox" name="u${p.id}_site_${s.id}" data-user-box="${p.id}" style="width:auto;margin:0" ${
-                assigned.has(s.id) ? 'checked' : ''
-              }> ${s.id === POOL_SITE_ID ? 'Pool' : esc(s.name)}</label>`
-          )
-          .join('')}
+    <details class="card assignment-card" data-user="${p.id}" ${people.length === 1 || assigned.size > 0 ? 'open' : ''}>
+      <summary class="assignment-summary">${esc(p.name)} <span class="muted" style="font-weight:400">· ${esc(ROLE_LABEL[p.role])} · <span class="assign-count" data-count-for="${p.id}">${assigned.size}</span> site(s)</span> <span class="badge half_day" data-dirty-for="${p.id}" style="display:none">unsaved changes</span></summary>
+      <div class="assignment-toolbar">
+        <input type="text" class="site-search" data-search-for="${p.id}" placeholder="Filter sites by number or name…" autocomplete="off">
+        <button type="button" class="btn secondary small" data-select-all="${p.id}">Select all</button>
+        <button type="button" class="btn secondary small" data-clear-all="${p.id}">Clear all</button>
+        <span class="muted small" data-search-hint="${p.id}" style="display:none">Select all / Clear all only affect the sites currently shown</span>
       </div>
-    </div>`;
+      <div class="grid grid-4" data-grid-for="${p.id}">
+        ${sites
+          .map((s) => {
+            const label = s.id === POOL_SITE_ID ? 'Pool' : s.name;
+            const searchText = esc(`${s.project_number != null ? s.project_number : ''} ${label}`.toLowerCase());
+            const isChecked = assigned.has(s.id);
+            return `<label class="site-checkbox-label${isChecked ? ' is-checked' : ''}" data-site-label="${p.id}" data-site-text="${searchText}"><input type="checkbox" name="u${p.id}_site_${s.id}" data-user-box="${p.id}" style="width:auto;margin:0" ${
+              isChecked ? 'checked' : ''
+            }> ${esc(label)}</label>`;
+          })
+          .join('')}
+        <p class="muted small" data-no-match-for="${p.id}" style="display:none;grid-column:1/-1">No sites match that filter.</p>
+      </div>
+    </details>`;
       })
       .join('')}
     <div class="actions" style="position:sticky;bottom:12px">
@@ -2804,17 +2885,73 @@ async function renderSiteAssignments(opts) {
   </form>
   <script>
   (function () {
-    // Mark a person's card the moment one of their checkboxes changes, and
-    // keep the live site-count current, so it's always obvious what will be
-    // saved and that saving is still pending.
+    function setDirty(uid) {
+      var badge = document.querySelector('[data-dirty-for="' + uid + '"]');
+      if (badge) badge.style.display = '';
+    }
+    function updateCount(uid) {
+      var count = document.querySelectorAll('input[data-user-box="' + uid + '"]:checked').length;
+      var counter = document.querySelector('[data-count-for="' + uid + '"]');
+      if (counter) counter.textContent = count;
+    }
+    // Mark a person's card the moment one of their checkboxes changes, keep
+    // the live site-count current, and highlight/unhighlight that checkbox's
+    // own label — so it's always obvious both what's currently assigned
+    // (at a glance, without reading every row) and that saving is pending.
     document.querySelectorAll('#site-assignments-form input[type=checkbox]').forEach(function (box) {
       box.addEventListener('change', function () {
         var uid = box.getAttribute('data-user-box');
-        var badge = document.querySelector('[data-dirty-for="' + uid + '"]');
-        if (badge) badge.style.display = '';
-        var count = document.querySelectorAll('input[data-user-box="' + uid + '"]:checked').length;
-        var counter = document.querySelector('[data-count-for="' + uid + '"]');
-        if (counter) counter.textContent = count;
+        setDirty(uid);
+        updateCount(uid);
+        var label = box.closest('.site-checkbox-label');
+        if (label) label.classList.toggle('is-checked', box.checked);
+      });
+    });
+    // Per-person live filter — type a project number or a bit of the site
+    // name and only matching rows stay visible. Select all / Clear all
+    // below act only on whatever's currently visible, so "134" + Select all
+    // is a one-shot way to assign a small cluster of sites.
+    document.querySelectorAll('.site-search').forEach(function (input) {
+      input.addEventListener('input', function () {
+        var uid = input.getAttribute('data-search-for');
+        var term = input.value.trim().toLowerCase();
+        var labels = document.querySelectorAll('[data-site-label="' + uid + '"]');
+        var anyVisible = false;
+        labels.forEach(function (label) {
+          var match = !term || label.getAttribute('data-site-text').indexOf(term) !== -1;
+          label.style.display = match ? '' : 'none';
+          if (match) anyVisible = true;
+        });
+        var noMatch = document.querySelector('[data-no-match-for="' + uid + '"]');
+        if (noMatch) noMatch.style.display = anyVisible ? 'none' : '';
+        var hint = document.querySelector('[data-search-hint="' + uid + '"]');
+        if (hint) hint.style.display = term ? '' : 'none';
+      });
+    });
+    document.querySelectorAll('[data-select-all]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var uid = btn.getAttribute('data-select-all');
+        document.querySelectorAll('[data-site-label="' + uid + '"]').forEach(function (label) {
+          if (label.style.display === 'none') return;
+          var box = label.querySelector('input[type=checkbox]');
+          if (box && !box.checked) {
+            box.checked = true;
+            box.dispatchEvent(new Event('change'));
+          }
+        });
+      });
+    });
+    document.querySelectorAll('[data-clear-all]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var uid = btn.getAttribute('data-clear-all');
+        document.querySelectorAll('[data-site-label="' + uid + '"]').forEach(function (label) {
+          if (label.style.display === 'none') return;
+          var box = label.querySelector('input[type=checkbox]');
+          if (box && box.checked) {
+            box.checked = false;
+            box.dispatchEvent(new Event('change'));
+          }
+        });
       });
     });
   })();
@@ -3036,7 +3173,17 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/' && req.method === 'GET') {
-    return send(res, 200, layout({ title: 'Dashboard', user, currentPath: pathname, body: await renderDashboard(user) }));
+    const isSiteOverseer = user.role === 'project_manager' || user.role === 'site_engineer';
+    return send(
+      res,
+      200,
+      layout({
+        title: isSiteOverseer ? (user.role === 'project_manager' ? 'My Projects' : 'My Sites') : 'Dashboard',
+        user,
+        currentPath: pathname,
+        body: isSiteOverseer ? await renderSiteOverseerHome(user) : await renderDashboard(user),
+      })
+    );
   }
 
   // v9.9: split out of the Dashboard (see renderDashboard) so the daily

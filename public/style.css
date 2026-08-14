@@ -198,6 +198,7 @@ body.has-sidebar .container { margin-left: var(--sidebar-w); }
 h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: -0.015em; font-weight: 800; }
 h2 { font-size: 16px; margin: 32px 0 14px; font-weight: 700; letter-spacing: -0.005em; }
 h2:first-child { margin-top: 0; }
+h3 { font-size: 15px; margin: 0 0 6px; font-weight: 700; letter-spacing: -0.005em; color: var(--text); }
 .subtitle { color: var(--muted); margin: 0 0 26px; font-size: 14px; max-width: 74ch; }
 
 .card {
@@ -407,6 +408,54 @@ details.admin-panel .details-body { margin-top: 18px; }
 
 .card.highlight { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
 .mt-0 { margin-top: 0; }
+
+/* Site assignments page — each person's card is a <details> so a page with
+   many Project Managers/Site Engineers doesn't force scrolling past
+   everyone else's site grid to find one person (collapsed by default
+   unless they already have assignments, or there's only one person). */
+details.assignment-card { padding: 22px 26px; }
+details.assignment-card summary {
+  cursor: pointer;
+  font-weight: 800;
+  font-size: 17px;
+  list-style: none;
+  color: var(--text);
+  margin: 0;
+}
+details.assignment-card summary::-webkit-details-marker { display: none; }
+details.assignment-card summary::before {
+  content: '\25B8';
+  font-size: 12px;
+  color: var(--muted-2);
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform 0.15s ease;
+}
+details.assignment-card[open] summary::before { transform: rotate(90deg); }
+.assignment-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 16px 0 14px;
+}
+.assignment-toolbar .site-search { width: 220px; max-width: 100%; margin: 0; }
+.assignment-toolbar .small { font-size: 12.5px; }
+.site-checkbox-label {
+  text-transform: none;
+  font-weight: 400;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  transition: background 0.1s ease;
+}
+/* Assigned sites get a visible tint so they read at a glance in a long
+   grid, instead of needing every checkbox scanned one by one. */
+.site-checkbox-label.is-checked { background: var(--primary-light); color: var(--primary-dark); font-weight: 600; }
+html[data-theme='dark'] .site-checkbox-label.is-checked { background: rgba(79, 70, 229, 0.28); color: #cfcbff; }
+.site-checkbox-label input[type="checkbox"] { width: auto; margin: 0; }
 .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
 
 /* ---- Pagination ---- */
