@@ -2632,8 +2632,8 @@ async function renderUsers(opts) {
     if (MULTI_SITE_ROLES.includes(u.role)) {
       const ids = multiSiteAssignments[u.id] || [];
       return ids.length
-        ? `${ids.map((id) => esc(siteNameById[id] || `Site ${id}`)).join(', ')} <a href="/site-assignments" class="muted" title="Change on the Site assignments tab">✎</a>`
-        : `<a href="/site-assignments">assign sites →</a>`;
+        ? `${ids.map((id) => esc(siteNameById[id] || `Site ${id}`)).join(', ')} <a href="/site-assignments?role=${u.role}&user=${u.id}" class="muted" title="Change on the Site assignments tab">✎</a>`
+        : `<a href="/site-assignments?role=${u.role}&user=${u.id}">assign sites →</a>`;
     }
     return esc(u.site_name || '—');
   };
@@ -2822,99 +2822,141 @@ async function renderAuditLog(query) {
 }
 
 // ---------- Site assignments (Project Managers / Site Engineers) ----------
-async function renderSiteAssignments(opts) {
-  const people = (await pool.query(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer') ORDER BY role, name`, [])).rows;
+// v11.1 (per Zen: the old one-page-with-everyone's-grid-open layout felt
+// crowded — "too much in one place"). Now a 3-step drill-down instead of
+// one long page: pick a role, pick a person within that role, then see and
+// edit just that one person's site checklist. Each step is its own render
+// function below, dispatched by GET /site-assignments on the ?role and
+// ?user query params; only the final step has anything to save, and it
+// saves through its own single-person POST route (see below) rather than
+// the old whole-page "rebuild everyone" submit.
+const SITE_OVERSEER_ROLES = ['project_manager', 'site_engineer'];
+
+async function siteAssignmentCounts() {
+  const counts = {}; // role -> { people: n, sites: n (sum across people) }
+  SITE_OVERSEER_ROLES.forEach((r) => (counts[r] = { people: 0, sites: 0 }));
+  const rows = (
+    await pool.query(
+      `SELECT u.role, COUNT(DISTINCT u.id) people, COUNT(usa.site_id) sites
+       FROM users u LEFT JOIN user_site_assignments usa ON usa.user_id = u.id
+       WHERE u.role IN ('project_manager','site_engineer') GROUP BY u.role`,
+      []
+    )
+  ).rows;
+  rows.forEach((r) => (counts[r.role] = { people: Number(r.people), sites: Number(r.sites) }));
+  return counts;
+}
+
+// Step 1 — choose a role.
+async function renderSiteAssignmentsRolePicker() {
+  const counts = await siteAssignmentCounts();
+  const cardFor = (role) => {
+    const c = counts[role];
+    const avg = c.people > 0 ? (c.sites / c.people).toFixed(1) : '0';
+    return `
+    <a href="/site-assignments?role=${role}" class="card role-picker-card">
+      <h2 style="margin-top:0">${esc(ROLE_LABEL[role])}s</h2>
+      <div class="stat-value">${c.people}</div>
+      <p class="muted">${c.people === 1 ? 'person' : 'people'} · ${c.sites} total site assignment(s)${c.people > 0 ? ` · ${avg} avg each` : ''}</p>
+    </a>`;
+  };
+  return `
+  <h1>Site assignments</h1>
+  <p class="subtitle">Project Managers and Site Engineers can be assigned to as many sites as needed (a Project Manager might oversee ten-plus; a Site Engineer one to three) — this is separate from a Supervisor's single site, set on the <a href="/users">Users</a> page. They get read-only oversight (dashboards/reports) for every site they're assigned; they can't mark attendance. Pick a role to see who's on it.</p>
+  <div class="grid grid-2">${SITE_OVERSEER_ROLES.map(cardFor).join('')}</div>`;
+}
+
+// Step 2 — choose a person within that role.
+async function renderSiteAssignmentsPeopleList(role) {
+  const people = (
+    await pool.query(`SELECT u.*, COUNT(usa.site_id) site_count FROM users u LEFT JOIN user_site_assignments usa ON usa.user_id = u.id WHERE u.role = $1 GROUP BY u.id ORDER BY u.name`, [
+      role,
+    ])
+  ).rows;
+  return `
+  <p class="breadcrumb"><a href="/site-assignments">← All roles</a></p>
+  <h1>${esc(ROLE_LABEL[role])}s</h1>
+  <p class="subtitle">Pick a person to see or change which sites they're assigned to.</p>
+  ${
+    people.length === 0
+      ? `<div class="card muted">No ${esc(ROLE_LABEL[role])} accounts yet — create one from <a href="/users">Users</a> first.</div>`
+      : `<div class="table-wrap"><table>
+      <tr><th>Name</th><th>Sites assigned</th><th></th></tr>
+      ${people
+        .map(
+          (p) =>
+            `<tr><td>${esc(p.name)}</td><td>${p.site_count} site(s)</td><td><a href="/site-assignments?role=${role}&user=${p.id}">${Number(p.site_count) > 0 ? 'View / edit' : 'Assign sites'} →</a></td></tr>`
+        )
+        .join('')}
+    </table></div>`
+  }`;
+}
+
+// Step 3 — one person's site checklist (search, select all/clear all, save).
+async function renderSiteAssignmentsPersonForm(person, opts) {
   const sites = (
     await pool.query(`SELECT * FROM sites ORDER BY (id = ${POOL_SITE_ID}) DESC, project_number NULLS LAST, name`, [])
   ).rows;
-  const assignedMap = {}; // user_id -> Set(site_id)
-  (await pool.query('SELECT user_id, site_id FROM user_site_assignments', [])).rows.forEach((r) => {
-    if (!assignedMap[r.user_id]) assignedMap[r.user_id] = new Set();
-    assignedMap[r.user_id].add(r.site_id);
-  });
-
-  // v9: the whole page is ONE form with a single save. The old version had a
-  // separate form + Save button per person — checking boxes on two people's
-  // cards and clicking one card's Save silently threw away the other card's
-  // changes on reload, and a successful save gave no feedback at all. Both
-  // read as "my assignments weren't saved" (reported by Zen). Now every
-  // change on the page saves together, a flash confirms exactly what was
-  // saved, and a card you've touched is visibly marked until you save.
-  const savedFlash = opts && opts.savedSummary ? `<div class="flash flash-success">Saved. ${esc(opts.savedSummary)}</div>` : '';
+  const assigned = new Set(
+    (await pool.query('SELECT site_id FROM user_site_assignments WHERE user_id = $1', [person.id])).rows.map((r) => r.site_id)
+  );
+  const savedFlash = opts && opts.saved ? `<div class="flash flash-success">Saved — ${esc(person.name)} is now assigned to ${assigned.size} site(s).</div>` : '';
 
   return `
-  <h1>Site assignments</h1>
-  <p class="subtitle">Project Managers and Site Engineers can be assigned to as many sites as needed (a Project Manager might oversee ten-plus; a Site Engineer one to three) — this is separate from a Supervisor's single site, set on the <a href="/users">Users</a> page. They get read-only oversight (dashboards/reports) for every site checked below; they can't mark attendance.</p>
+  <p class="breadcrumb"><a href="/site-assignments">← All roles</a> · <a href="/site-assignments?role=${person.role}">← ${esc(ROLE_LABEL[person.role])}s</a></p>
+  <h1>${esc(person.name)}</h1>
+  <p class="subtitle">${esc(ROLE_LABEL[person.role])} · check every site they should have read-only oversight of.</p>
   ${savedFlash}
-  ${
-    people.length === 0
-      ? `<div class="card muted">No Project Manager or Site Engineer accounts yet — create one from <a href="/users">Users</a> first.</div>`
-      : `
-  <form method="POST" action="/site-assignments" id="site-assignments-form">
-    ${people
-      .map((p) => {
-        const assigned = assignedMap[p.id] || new Set();
-        return `
-    <details class="card assignment-card" data-user="${p.id}" ${people.length === 1 || assigned.size > 0 ? 'open' : ''}>
-      <summary class="assignment-summary">${esc(p.name)} <span class="muted" style="font-weight:400">· ${esc(ROLE_LABEL[p.role])} · <span class="assign-count" data-count-for="${p.id}">${assigned.size}</span> site(s)</span> <span class="badge half_day" data-dirty-for="${p.id}" style="display:none">unsaved changes</span></summary>
+  <form method="POST" action="/site-assignments/${person.id}" id="site-assignments-form">
+    <div class="card assignment-card">
       <div class="assignment-toolbar">
-        <input type="text" class="site-search" data-search-for="${p.id}" placeholder="Filter sites by number or name…" autocomplete="off">
-        <button type="button" class="btn secondary small" data-select-all="${p.id}">Select all</button>
-        <button type="button" class="btn secondary small" data-clear-all="${p.id}">Clear all</button>
-        <span class="muted small" data-search-hint="${p.id}" style="display:none">Select all / Clear all only affect the sites currently shown</span>
+        <input type="text" class="site-search" data-search-for="${person.id}" placeholder="Filter sites by number or name…" autocomplete="off">
+        <button type="button" class="btn secondary small" data-select-all="${person.id}">Select all</button>
+        <button type="button" class="btn secondary small" data-clear-all="${person.id}">Clear all</button>
+        <span class="muted small" data-search-hint="${person.id}" style="display:none">Select all / Clear all only affect the sites currently shown</span>
+        <span class="muted small" style="margin-left:auto"><span class="assign-count" data-count-for="${person.id}">${assigned.size}</span> site(s) checked</span>
       </div>
-      <div class="grid grid-4" data-grid-for="${p.id}">
+      <div class="grid grid-4" data-grid-for="${person.id}">
         ${sites
           .map((s) => {
             const label = s.id === POOL_SITE_ID ? 'Pool' : s.name;
             const searchText = esc(`${s.project_number != null ? s.project_number : ''} ${label}`.toLowerCase());
             const isChecked = assigned.has(s.id);
-            return `<label class="site-checkbox-label${isChecked ? ' is-checked' : ''}" data-site-label="${p.id}" data-site-text="${searchText}"><input type="checkbox" name="u${p.id}_site_${s.id}" data-user-box="${p.id}" style="width:auto;margin:0" ${
+            return `<label class="site-checkbox-label${isChecked ? ' is-checked' : ''}" data-site-label="${person.id}" data-site-text="${searchText}"><input type="checkbox" name="site_${s.id}" data-user-box="${person.id}" style="width:auto;margin:0" ${
               isChecked ? 'checked' : ''
             }> ${esc(label)}</label>`;
           })
           .join('')}
-        <p class="muted small" data-no-match-for="${p.id}" style="display:none;grid-column:1/-1">No sites match that filter.</p>
+        <p class="muted small" data-no-match-for="${person.id}" style="display:none;grid-column:1/-1">No sites match that filter.</p>
       </div>
-    </details>`;
-      })
-      .join('')}
+    </div>
     <div class="actions" style="position:sticky;bottom:12px">
-      <button class="btn" type="submit">Save all assignments</button>
+      <button class="btn" type="submit">Save assignments</button>
     </div>
   </form>
   <script>
   (function () {
-    function setDirty(uid) {
-      var badge = document.querySelector('[data-dirty-for="' + uid + '"]');
-      if (badge) badge.style.display = '';
-    }
-    function updateCount(uid) {
+    var uid = '${person.id}';
+    function updateCount() {
       var count = document.querySelectorAll('input[data-user-box="' + uid + '"]:checked').length;
       var counter = document.querySelector('[data-count-for="' + uid + '"]');
       if (counter) counter.textContent = count;
     }
-    // Mark a person's card the moment one of their checkboxes changes, keep
-    // the live site-count current, and highlight/unhighlight that checkbox's
-    // own label — so it's always obvious both what's currently assigned
-    // (at a glance, without reading every row) and that saving is pending.
     document.querySelectorAll('#site-assignments-form input[type=checkbox]').forEach(function (box) {
       box.addEventListener('change', function () {
-        var uid = box.getAttribute('data-user-box');
-        setDirty(uid);
-        updateCount(uid);
+        updateCount();
         var label = box.closest('.site-checkbox-label');
         if (label) label.classList.toggle('is-checked', box.checked);
       });
     });
-    // Per-person live filter — type a project number or a bit of the site
-    // name and only matching rows stay visible. Select all / Clear all
-    // below act only on whatever's currently visible, so "134" + Select all
-    // is a one-shot way to assign a small cluster of sites.
-    document.querySelectorAll('.site-search').forEach(function (input) {
-      input.addEventListener('input', function () {
-        var uid = input.getAttribute('data-search-for');
-        var term = input.value.trim().toLowerCase();
+    // Live filter — type a project number or a bit of the site name and
+    // only matching rows stay visible. Select all / Clear all below act
+    // only on whatever's currently visible, so "134" + Select all is a
+    // one-shot way to assign a small cluster of sites.
+    var searchInput = document.querySelector('.site-search[data-search-for="' + uid + '"]');
+    if (searchInput) {
+      searchInput.addEventListener('input', function () {
+        var term = searchInput.value.trim().toLowerCase();
         var labels = document.querySelectorAll('[data-site-label="' + uid + '"]');
         var anyVisible = false;
         labels.forEach(function (label) {
@@ -2927,10 +2969,9 @@ async function renderSiteAssignments(opts) {
         var hint = document.querySelector('[data-search-hint="' + uid + '"]');
         if (hint) hint.style.display = term ? '' : 'none';
       });
-    });
+    }
     document.querySelectorAll('[data-select-all]').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        var uid = btn.getAttribute('data-select-all');
         document.querySelectorAll('[data-site-label="' + uid + '"]').forEach(function (label) {
           if (label.style.display === 'none') return;
           var box = label.querySelector('input[type=checkbox]');
@@ -2943,7 +2984,6 @@ async function renderSiteAssignments(opts) {
     });
     document.querySelectorAll('[data-clear-all]').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        var uid = btn.getAttribute('data-clear-all');
         document.querySelectorAll('[data-site-label="' + uid + '"]').forEach(function (label) {
           if (label.style.display === 'none') return;
           var box = label.querySelector('input[type=checkbox]');
@@ -2955,9 +2995,7 @@ async function renderSiteAssignments(opts) {
       });
     });
   })();
-  </script>`
-  }
-  `;
+  </script>`;
 }
 
 // ---------- Router ----------
@@ -4774,48 +4812,55 @@ async function handleRequest(req, res) {
   }
 
   // ---- Site assignments (Project Managers / Site Engineers -> many sites) ----
+  // v11.1: a 3-step drill-down (role -> person -> that person's checklist)
+  // instead of one long page — see the render functions above for why.
   if (pathname === '/site-assignments' && req.method === 'GET') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
-    return send(
-      res,
-      200,
-      layout({
-        title: 'Site assignments',
-        user,
-        currentPath: pathname,
-        body: await renderSiteAssignments({ savedSummary: query.saved ? decodeURIComponent(query.saved) : null }),
-      })
-    );
+    let body;
+    let title = 'Site assignments';
+    if (query.role && query.user) {
+      const person = (
+        await pool.query(`SELECT * FROM users WHERE id = $1 AND role = $2`, [query.user, query.role])
+      ).rows[0];
+      if (!person) return send(res, 404, layout({ title: 'Not found', user, currentPath: pathname, body: '<div class="card"><h1>404</h1><p>That person wasn\'t found.</p></div>' }));
+      title = person.name;
+      body = await renderSiteAssignmentsPersonForm(person, { saved: query.saved === '1' });
+    } else if (query.role && SITE_OVERSEER_ROLES.includes(query.role)) {
+      title = `${ROLE_LABEL[query.role]}s`;
+      body = await renderSiteAssignmentsPeopleList(query.role);
+    } else {
+      body = await renderSiteAssignmentsRolePicker();
+    }
+    return send(res, 200, layout({ title, user, currentPath: '/site-assignments', body }));
   }
-  if (pathname === '/site-assignments' && req.method === 'POST') {
+  const siteAssignmentSaveMatch = pathname.match(/^\/site-assignments\/(\d+)$/);
+  if (siteAssignmentSaveMatch && req.method === 'POST') {
     if (!can(user, 'admin.full')) return forbidden(res, user, pathname, layout);
+    const targetId = Number(siteAssignmentSaveMatch[1]);
+    const person = (await pool.query(`SELECT * FROM users WHERE id = $1 AND role IN ('project_manager','site_engineer')`, [targetId])).rows[0];
+    if (!person) return send(res, 404, 'Not found');
     const b = reqBody;
-    // One submit carries EVERY person's checkboxes (named u<userId>_site_<siteId>
-    // — the form parser doesn't collect repeated keys into arrays, so each
-    // box gets a unique name). Rebuild every PM/SE's assignment set in a
-    // single transaction so the whole page saves atomically — no more losing
-    // one person's changes by saving another's.
-    const people = (await pool.query(`SELECT * FROM users WHERE role IN ('project_manager','site_engineer')`, [])).rows;
-    const summaryParts = [];
-    // Same same-client requirement as the user-delete transaction above.
+    // Only this one person's checkboxes are on the form now (named
+    // site_<siteId>, no user-id prefix needed since the whole page is
+    // scoped to them) — rebuild just their assignment set. Scoping the
+    // DELETE/INSERT to a single user_id, rather than looping every PM/SE
+    // like the old whole-page submit did, means saving one person's
+    // checklist can never wipe another person's assignments just because
+    // their checkboxes weren't part of this particular submit.
+    const siteIds = Object.keys(b)
+      .map((k) => k.match(/^site_(\d+)$/))
+      .filter(Boolean)
+      .map((m) => Number(m[1]));
     const assignClient = await pool.connect();
     try {
       await assignClient.query('BEGIN');
-      for (const p of people) {
-        const re = new RegExp(`^u${p.id}_site_(\\d+)$`);
-        const siteIds = Object.keys(b)
-          .map((k) => k.match(re))
-          .filter(Boolean)
-          .map((m) => Number(m[1]));
-        await assignClient.query('DELETE FROM user_site_assignments WHERE user_id = $1', [p.id]);
-        for (const sid of siteIds) {
-          await assignClient.query('INSERT INTO user_site_assignments (user_id, site_id, created_at) VALUES ($1, $2, $3)', [
-            p.id,
-            sid,
-            nowSqliteStyle(),
-          ]);
-        }
-        summaryParts.push(`${p.name}: ${siteIds.length} site(s)`);
+      await assignClient.query('DELETE FROM user_site_assignments WHERE user_id = $1', [targetId]);
+      for (const sid of siteIds) {
+        await assignClient.query('INSERT INTO user_site_assignments (user_id, site_id, created_at) VALUES ($1, $2, $3)', [
+          targetId,
+          sid,
+          nowSqliteStyle(),
+        ]);
       }
       await assignClient.query('COMMIT');
     } catch (e) {
@@ -4824,8 +4869,8 @@ async function handleRequest(req, res) {
     } finally {
       assignClient.release();
     }
-    await logAudit(user.id, 'update', 'site_assignments', null, summaryParts.join(' · '));
-    return redirect(res, `/site-assignments?saved=${encodeURIComponent(summaryParts.join(' · '))}`);
+    await logAudit(user.id, 'update', 'site_assignments', targetId, `${person.name}: ${siteIds.length} site(s)`);
+    return redirect(res, `/site-assignments?role=${person.role}&user=${targetId}&saved=1`);
   }
 
   send(res, 404, layout({ title: 'Not found', user, currentPath: pathname, body: '<div class="card"><h1>404</h1><p>Page not found.</p></div>' }));
